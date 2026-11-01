@@ -16,10 +16,25 @@ android {
         versionName = "0.3.0"
     }
 
+    signingConfigs {
+        // 固定的自签名密钥（标准 Android debug keystore），提交在仓库里：
+        // 这样本地和 GitHub Actions 构建出的 APK 签名一致，用户可以直接覆盖安装更新。
+        create("shared") {
+            storeFile = file("../keystore/inputsharex-debug.jks")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("shared")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("shared")
         }
     }
 

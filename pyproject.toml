@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inputsharex"
+version = "0.4.2"
+description = "Windows 鼠标/键盘共享到 Android（无线 ADB + scrcpy UHID），带无线链路保活"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "inputsharex" }]
+dependencies = ["cryptography>=43", "segno>=1.5"]
+
+[project.optional-dependencies]
+gui = ["PySide6-Essentials>=6.6"]
+
+[project.scripts]
+inputsharex = "inputsharex.cli:main"
+inputsharex-gui = "inputsharex.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -35,6 +35,13 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "apk=inputsharex-android-$VERSION.apk" >> "$GITHUB_OUTPUT"
 
+      - name: Use official Gradle distribution
+        shell: bash
+        working-directory: android
+        run: |
+          # 仓库默认使用国内镜像下载 Gradle；GitHub runner 在海外，官方源更快更稳。
+          sed -i 's|^distributionUrl=.*|distributionUrl=https\\://services.gradle.org/distributions/gradle-8.11.1-bin.zip|' gradle/wrapper/gradle-wrapper.properties
+
       - name: Build debug APK
         shell: bash
         working-directory: android

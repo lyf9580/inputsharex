@@ -303,3 +303,46 @@ def test_arrow_keys_stay_hid_when_switch_disabled_or_unknown_size():
     value._on_key(0x25, 0x4B, True, False)
     value.session.keyboard_event.assert_called_once_with(0x25, 0x4B, True, False)
     value.session.swipe_horizontal.assert_not_called()
+
+
+def test_extended_monitor_edge_switch_disabled_by_default():
+    from inputsharex import capture as capture_module
+
+    value = InputCapture(edge_switch=True, edge=capture_module.EDGE_RIGHT, edge_zone=6)
+    entered = []
+    value._enter = lambda x, y, edge_mode: entered.append((x, y, edge_mode))
+    secondary = (1920, 0, 3840, 1080)
+    primary = (0, 0, 1920, 1080)
+    with patch.object(capture_module, "_monitor_rect", return_value=secondary), \
+            patch.object(capture_module, "_primary_monitor_rect", return_value=primary):
+        value._check_edge_trigger(10, 0, pos=(3838, 500))
+    assert entered == []
+
+    value.set_allow_extended_edge(True)
+    with patch.object(capture_module, "_monitor_rect", return_value=secondary), \
+            patch.object(capture_module, "_primary_monitor_rect", return_value=primary):
+        value._check_edge_trigger(10, 0, pos=(3838, 500))
+    assert entered == [(3838, 500, True)]
+
+
+def test_primary_monitor_edge_switch_works_when_extended_disabled():
+    from inputsharex import capture as capture_module
+
+    value = InputCapture(edge_switch=True, edge=capture_module.EDGE_RIGHT, edge_zone=6)
+    entered = []
+    value._enter = lambda x, y, edge_mode: entered.append((x, y, edge_mode))
+    primary = (0, 0, 1920, 1080)
+    with patch.object(capture_module, "_monitor_rect", return_value=primary), \
+            patch.object(capture_module, "_primary_monitor_rect", return_value=primary):
+        value._check_edge_trigger(10, 0, pos=(1918, 500))
+    assert entered == [(1918, 500, True)]
+
+
+def test_extended_edge_setting_defaults_off_and_updates_capture():
+    value = controller()
+    assert DEFAULT_CONFIG["edge_on_extended"] is False
+    value.capture = Mock()
+    with patch("inputsharex.app.save_config") as save:
+        value.update_config(edge_on_extended=True)
+    save.assert_called_once()
+    value.capture.set_allow_extended_edge.assert_called_once_with(True)

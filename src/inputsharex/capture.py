@@ -92,6 +92,7 @@ SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 SW_HIDE = 0
 MONITOR_DEFAULTTONEAREST = 2
+MONITOR_DEFAULTTOPRIMARY = 1
 OCR_NORMAL = 32512
 
 
@@ -271,9 +272,7 @@ user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
 user32.RegisterClassW.restype = wintypes.ATOM
 
 
-def _monitor_rect(x: int, y: int) -> tuple[int, int, int, int]:
-    """返回 (left, top, right, bottom)，单位是虚拟桌面坐标（可含负数）。"""
-    hmon = user32.MonitorFromPoint(POINT(x, y), MONITOR_DEFAULTTONEAREST)
+def _monitor_rect_from_handle(hmon) -> tuple[int, int, int, int]:
     if not hmon:
         return (0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
     mi = MONITORINFO()
@@ -282,6 +281,18 @@ def _monitor_rect(x: int, y: int) -> tuple[int, int, int, int]:
         return (0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
     r = mi.rcMonitor
     return (r.left, r.top, r.right, r.bottom)
+
+
+def _monitor_rect(x: int, y: int) -> tuple[int, int, int, int]:
+    """返回 (left, top, right, bottom)，单位是虚拟桌面坐标（可含负数）。"""
+    hmon = user32.MonitorFromPoint(POINT(x, y), MONITOR_DEFAULTTONEAREST)
+    return _monitor_rect_from_handle(hmon)
+
+
+def _primary_monitor_rect() -> tuple[int, int, int, int]:
+    """主显示器矩形；用于判断光标是否在扩展屏上。"""
+    hmon = user32.MonitorFromPoint(POINT(0, 0), MONITOR_DEFAULTTOPRIMARY)
+    return _monitor_rect_from_handle(hmon)
 
 
 class InputCapture:
@@ -295,7 +306,7 @@ class InputCapture:
                  on_edge=None, on_key=None, on_clipboard=None,
                  hotkey_mods: int = MOD_CONTROL | MOD_ALT, hotkey_vk: int = VK_Q,
                  edge_switch: bool = True, edge: int = EDGE_RIGHT, edge_zone: int = 6,
-                 return_px: int = 96):
+                 return_px: int = 96, allow_extended_edge: bool = False):
         self.on_move = on_move or (lambda dx, dy, buttons: None)
         self.on_button = on_button or (lambda buttons: None)
         self.on_wheel = on_wheel or (lambda v, h: None)
@@ -307,6 +318,7 @@ class InputCapture:
         self.hotkey_mods = hotkey_mods
         self.hotkey_vk = hotkey_vk
         self.edge_switch = bool(edge_switch)
+        self.allow_extended_edge = bool(allow_extended_edge)
         self.edge = int(edge)
         self.edge_zone = max(int(edge_zone), 1)
         self.return_px = max(int(return_px), 24)
@@ -549,21 +561,27 @@ class InputCapture:
             self._acc_y += dy
 
     # -- 边缘切换（按光标所在显示器判定）----------------------------
-    def _check_edge_trigger(self, dx: int, dy: int) -> None:
-        pos = POINT()
-        if not user32.GetCursorPos(ctypes.byref(pos)):
+    def _check_edge_trigger(self, dx: int, dy: int,
+                            pos: tuple[int, int] | None = None) -> None:
+        if pos is None:
+            point = POINT()
+            if not user32.GetCursorPos(ctypes.byref(point)):
+                return
+            pos = (point.x, point.y)
+        left, top, right, bottom = _monitor_rect(pos[0], pos[1])
+        if not self.allow_extended_edge and (left, top, right, bottom) != _primary_monitor_rect():
+            # 默认不把扩展显示器上撞边当成切换意图，避免外接屏用户频繁误触发。
             return
-        left, top, right, bottom = _monitor_rect(pos.x, pos.y)
         z = self.edge_zone
         edge = self.edge
-        if edge == EDGE_RIGHT and dx > 0 and pos.x >= right - 1 - z:
-            self._enter(pos.x, pos.y, edge_mode=True)
-        elif edge == EDGE_LEFT and dx < 0 and pos.x <= left + z:
-            self._enter(pos.x, pos.y, edge_mode=True)
-        elif edge == EDGE_BOTTOM and dy > 0 and pos.y >= bottom - 1 - z:
-            self._enter(pos.x, pos.y, edge_mode=True)
-        elif edge == EDGE_TOP and dy < 0 and pos.y <= top + z:
-            self._enter(pos.x, pos.y, edge_mode=True)
+        if edge == EDGE_RIGHT and dx > 0 and pos[0] >= right - 1 - z:
+            self._enter(pos[0], pos[1], edge_mode=True)
+        elif edge == EDGE_LEFT and dx < 0 and pos[0] <= left + z:
+            self._enter(pos[0], pos[1], edge_mode=True)
+        elif edge == EDGE_BOTTOM and dy > 0 and pos[1] >= bottom - 1 - z:
+            self._enter(pos[0], pos[1], edge_mode=True)
+        elif edge == EDGE_TOP and dy < 0 and pos[1] <= top + z:
+            self._enter(pos[0], pos[1], edge_mode=True)
 
     def _should_return(self) -> bool:
         # Raw counts do not describe Android's accelerated, clamped cursor position.
@@ -678,6 +696,10 @@ class InputCapture:
 
     def set_edge_switch(self, enabled: bool) -> None:
         self.edge_switch = bool(enabled)
+
+    def set_allow_extended_edge(self, enabled: bool) -> None:
+        """是否允许在扩展显示器上撞边触发切换（关闭时只看主显示器）。"""
+        self.allow_extended_edge = bool(enabled)
 
     # -- lifecycle -------------------------------------------------
     def stop(self) -> None:

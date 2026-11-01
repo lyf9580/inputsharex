@@ -48,6 +48,7 @@ DEFAULT_CONFIG = {
     "cadence_ms": 4,
     "edge_switch": True,
     "edge_zone": 6,
+    "edge_on_extended": False,
     "hotkey": "ctrl+alt+q",
     "start_armed": False,
     "auto_connect": True,
@@ -642,6 +643,7 @@ class AppController(QObject):
                 edge_switch=bool(self.config.get("edge_switch", True)),
                 edge=int(self.config.get("placement", 0)),
                 edge_zone=int(self.config.get("edge_zone", 6)),
+                allow_extended_edge=bool(self.config.get("edge_on_extended", False)),
             )
             self.capture = capture
             capture.can_capture = lambda: (self._sharing and self.state == "sharing"
@@ -995,6 +997,8 @@ class AppController(QObject):
                     self.pointer_monitor.set_enabled(self._armed, self._capture_generation, int(changes["placement"]))
             if "edge_switch" in changes:
                 self.capture.set_edge_switch(bool(changes["edge_switch"]))
+            if "edge_on_extended" in changes:
+                self.capture.set_allow_extended_edge(bool(changes["edge_on_extended"]))
         if self.device_link is not None:
             self.device_link.send_config(self._link_config())
         self._publish_sharing_state()

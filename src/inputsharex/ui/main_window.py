@@ -386,6 +386,12 @@ class MainWindow(QMainWindow):
             "指针碰到屏幕边缘时把焦点交给安卓端（需已连接）",
             self.edge_switch,
         )
+        self.extended_edge_switch = self._new_switch()
+        mouse.add_row(
+            "扩展屏边缘切换",
+            "开启后鼠标在扩展显示器边缘也会切到安卓端；关闭时只在主显示器触发（默认关闭）",
+            self.extended_edge_switch,
+        )
         self.double_combo = QComboBox()
         self.double_combo.addItem("关闭", False)
         self.double_combo.addItem("300 ms（合并为双击）", True)
@@ -872,6 +878,7 @@ class MainWindow(QMainWindow):
         self.auto_connect_switch.set_checked_silently(bool(config.get("auto_connect", True)))
         self.keep_awake_switch.set_checked_silently(bool(config.get("android_keep_awake", True)))
         self.edge_switch.set_checked_silently(bool(config.get("edge_switch", True)))
+        self.extended_edge_switch.set_checked_silently(bool(config.get("edge_on_extended", False)))
         self.lock_refresh_switch.set_checked_silently(bool(config.get("lock_refresh", False)))
         self.arrow_images_switch.set_checked_silently(bool(config.get("arrow_switch_images", False)))
         self.double_combo.setCurrentIndex(1 if bool(config.get("double_trigger", False)) else 0)
@@ -896,6 +903,9 @@ class MainWindow(QMainWindow):
             lambda checked: self._save(android_keep_awake=checked)
         )
         self.edge_switch.toggled.connect(lambda checked: self._save(edge_switch=checked))
+        self.extended_edge_switch.toggled.connect(
+            lambda checked: self._save(edge_on_extended=checked)
+        )
         self.lock_refresh_switch.toggled.connect(
             lambda checked: self._save(lock_refresh=checked)
         )

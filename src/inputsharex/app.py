@@ -601,6 +601,7 @@ class AppController(QObject):
             session = ControlSession(sock, keepalive_interval=interval, cadence_ms=cadence)
             self.session = session
             session.create_mouse("inputsharex")
+            session.create_keyboard("inputsharex")
             session.start()
             if not self._sharing:
                 return
@@ -622,6 +623,7 @@ class AppController(QObject):
                 on_move=lambda dx, dy, buttons: session.mouse_move(dx, dy, buttons),
                 on_button=lambda buttons: session.mouse_button(buttons),
                 on_wheel=lambda v, h: session.scroll(v, h),
+                on_key=self._on_key,
                 on_toggle=self._on_arm_toggle,
                 on_edge=self._on_edge,
                 hotkey_mods=mods,
@@ -700,11 +702,27 @@ class AppController(QObject):
         self._capture_generation = time.time_ns()
         if self.pointer_monitor:
             self.pointer_monitor.set_enabled(armed, self._capture_generation, self.config.get("placement", 0))
+        if not armed and self.session is not None:
+            # 切回电脑时清掉安卓端所有按键状态，避免 Ctrl/Shift 或字符卡住。
+            try:
+                self.session.release_keys()
+            except Exception:
+                pass
         self._publish_sharing_state()
         if armed:
             self._log("鼠标已切换到平板（移动回原侧边缘可切回）")
         else:
             self._log("鼠标已切回电脑")
+
+    def _on_key(self, vk: int, scan: int, extended: bool, up: bool) -> None:
+        """接管期间把 PC 键盘事件转发到安卓（由低级键盘钩子回调）。"""
+        session = self.session
+        if session is None or session.closed:
+            return
+        try:
+            session.keyboard_event(vk, scan, extended, up)
+        except Exception:
+            pass
 
     def _on_edge(self, edge: int, entered: bool) -> None:
         names = {0: "右", 1: "左", 2: "下", 3: "上"}

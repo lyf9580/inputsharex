@@ -16,7 +16,7 @@ import socket
 import threading
 import time
 
-from . import hid, protocol
+from . import hid, keyboard, protocol
 
 # 单拍最多合并多少帧位移（用户甩鼠标时防止一次发几十帧把空口挤爆）
 MAX_REPORTS_PER_TICK = 8
@@ -84,6 +84,8 @@ class ControlSession:
         self._dirty = False
         self._pending_since = 0.0
         self._latency_samples: list[float] = []
+        self._kb_mods = 0
+        self._kb_keys: list[int] = []
         try:
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
@@ -126,6 +128,8 @@ class ControlSession:
     def destroy_devices(self) -> None:
         self.send(protocol.uhid_destroy(hid.HID_MOUSE_ID))
         self.send(protocol.uhid_destroy(hid.HID_KEYBOARD_ID))
+        self._kb_mods = 0
+        self._kb_keys = []
 
     # -- input -----------------------------------------------------
     def mouse_move(self, dx: int, dy: int, buttons: int | None = None) -> None:
@@ -185,6 +189,58 @@ class ControlSession:
 
     def text(self, value: str) -> None:
         self.send(protocol.inject_text(value))
+
+    # -- 键盘（UHID 物理键盘） --------------------------------------
+    def keyboard_event(self, vk: int, scan: int, extended: bool, up: bool) -> None:
+        """把一次 Windows 键盘事件转成 HID 键盘报文发到安卓。
+
+        只有状态真的变化才发包：按住不放时系统会重复上报 down，安卓内核
+        自己会做按键重复，重复报文反而可能让按键抖动。
+        """
+        if self._closed:
+            return
+        bit = keyboard.modifier_bit(vk, scan, extended)
+        usage = None if bit else keyboard.usage_for(vk, scan, extended)
+        with self._lock:
+            if self._closed:
+                return
+            changed = False
+            if bit:
+                old = self._kb_mods
+                self._kb_mods = (self._kb_mods & ~bit) if up else (self._kb_mods | bit)
+                changed = self._kb_mods != old
+            elif usage is not None:
+                if up:
+                    if usage in self._kb_keys:
+                        self._kb_keys.remove(usage)
+                        changed = True
+                elif usage not in self._kb_keys and len(self._kb_keys) < 6:
+                    self._kb_keys.append(usage)
+                    changed = True
+            if not changed:
+                return
+            payload = protocol.uhid_input(
+                hid.HID_KEYBOARD_ID, hid.keyboard_report(self._kb_mods, self._kb_keys)
+            )
+            self._send_locked(payload)
+            self.sent_bytes += len(payload)
+            self.sent_messages += 1
+
+    def release_keys(self) -> None:
+        """切回电脑/停止共享时清空所有按键，避免修饰键或字符键卡在安卓端。"""
+        if self._closed:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            if not self._kb_mods and not self._kb_keys:
+                return
+            self._kb_mods = 0
+            self._kb_keys = []
+            payload = protocol.uhid_input(hid.HID_KEYBOARD_ID, hid.keyboard_report())
+            self._send_locked(payload)
+            self.sent_bytes += len(payload)
+            self.sent_messages += 1
 
     # -- 合并发送线程 ----------------------------------------------
     def set_keepalive(self, keepalive_ms: float) -> None:

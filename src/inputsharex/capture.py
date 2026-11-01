@@ -20,6 +20,8 @@ import threading
 import uuid
 from ctypes import wintypes
 
+from .keyboard import modifier_bit as _modifier_bit
+
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -28,6 +30,18 @@ WM_HOTKEY = 0x0312
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
 WM_SETCURSOR = 0x0020
+
+# 低级键盘钩子：接管时把 PC 键盘事件转发给安卓，并拦下本地按键。
+WH_KEYBOARD_LL = 13
+LLKHF_EXTENDED = 0x01
+LLKHF_INJECTED = 0x10
+LLKHF_UP = 0x80
+
+# 修饰键在位掩码里的分组（hid 键盘报文第一字节）
+_KB_CTRL_BITS = 0x01 | 0x10
+_KB_ALT_BITS = 0x04 | 0x40
+_KB_SHIFT_BITS = 0x02 | 0x20
+_KB_GUI_BITS = 0x08 | 0x80
 
 RID_INPUT = 0x10000003
 RIDEV_INPUTSINK = 0x00000100
@@ -149,8 +163,17 @@ class RECT(ctypes.Structure):
     ]
 
 
-class MONITORINFO(ctypes.Structure):
+class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+class MONITORINFO(ctypes.Structure):    _fields_ = [
         ("cbSize", wintypes.DWORD),
         ("rcMonitor", RECT),
         ("rcWork", RECT),
@@ -161,6 +184,21 @@ class MONITORINFO(ctypes.Structure):
 WNDPROC = ctypes.WINFUNCTYPE(
     ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
 )
+
+HOOKPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+)
+
+user32.SetWindowsHookExW.restype = ctypes.c_void_p
+user32.SetWindowsHookExW.argtypes = [
+    ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD
+]
+user32.CallNextHookEx.restype = ctypes.c_ssize_t
+user32.CallNextHookEx.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+]
+user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
 
 user32.DefWindowProcW.argtypes = [
     wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
@@ -247,7 +285,8 @@ class InputCapture:
     """
 
     def __init__(self, on_move=None, on_button=None, on_wheel=None, on_toggle=None,
-                 on_edge=None, hotkey_mods: int = MOD_CONTROL | MOD_ALT, hotkey_vk: int = VK_Q,
+                 on_edge=None, on_key=None,
+                 hotkey_mods: int = MOD_CONTROL | MOD_ALT, hotkey_vk: int = VK_Q,
                  edge_switch: bool = True, edge: int = EDGE_RIGHT, edge_zone: int = 6,
                  return_px: int = 96):
         self.on_move = on_move or (lambda dx, dy, buttons: None)
@@ -255,6 +294,7 @@ class InputCapture:
         self.on_wheel = on_wheel or (lambda v, h: None)
         self.on_toggle = on_toggle or (lambda armed: None)
         self.on_edge = on_edge or (lambda edge, entered: None)
+        self.on_key = on_key or (lambda vk, scan, extended, up: None)
         self.can_capture = lambda: True
         self.hotkey_mods = hotkey_mods
         self.hotkey_vk = hotkey_vk
@@ -273,6 +313,8 @@ class InputCapture:
         self._anchor = (0, 0)
         self._acc_x = 0
         self._acc_y = 0
+        self._kb_mods = 0
+        self._hook = None
         suffix = uuid.uuid4().hex
         self._class_names = ("inputsharex_capture_" + suffix, "inputsharex_trap_" + suffix)
 
@@ -311,12 +353,24 @@ class InputCapture:
             print("[!] RegisterRawInputDevices 失败，鼠标位移可能收不到")
         if not user32.RegisterHotKey(hwnd, 1, self.hotkey_mods | MOD_NOREPEAT, self.hotkey_vk):
             print("[!] 全局热键注册失败（可能被其他程序占用），可换 --hotkey")
+        try:
+            self._hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_ref(), hinstance, 0)
+            if not self._hook:
+                print("[!] 键盘钩子安装失败，键盘不会转发到平板")
+        except Exception:
+            self._hook = None
         self._ready.set()
 
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
+        if self._hook:
+            try:
+                user32.UnhookWindowsHookEx(self._hook)
+            except Exception:
+                pass
+            self._hook = None
         user32.UnregisterHotKey(hwnd, 1)
         if self._trap:
             user32.DestroyWindow(self._trap)
@@ -345,6 +399,61 @@ class InputCapture:
         except Exception:
             pass
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    # -- 键盘转发 ---------------------------------------------------
+    def _hook_ref(self):
+        if not hasattr(self, "_ll_proc"):
+            self._ll_proc = HOOKPROC(self._low_level_keyboard)
+        return self._ll_proc
+
+    def _low_level_keyboard(self, n_code, wparam, lparam):
+        """接管时截获键盘：修饰键放给系统并转发，其余键转发后拦下本地输入。
+
+        - 修饰键（Ctrl/Shift/Alt）放给系统，RegisterHotKey 才能看到 Ctrl+Alt+Q；
+          同时转发给安卓，Ctrl+C / Ctrl+V 才有 Ctrl。
+        - 热键键本身放给系统，让 WM_HOTKEY 触发切换，不转发到安卓。
+        - 其它键全部拦下（PC 前台应用收不到），只发到安卓。
+        - 不在这里判断 LLKHF_INJECTED：本项目自己不会注入按键，保留注入键便于
+          自动化验证；实际使用中来自其它软件的注入键也会一并转发。
+        """
+        passthrough = 0
+        try:
+            if n_code < 0 or not self.armed:
+                return user32.CallNextHookEx(None, n_code, wparam, lparam)
+            data = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            up = bool(data.flags & LLKHF_UP)
+            extended = bool(data.flags & LLKHF_EXTENDED)
+            vk = int(data.vkCode)
+            scan = int(data.scanCode) & 0xFF
+            bit = _modifier_bit(vk, scan, extended)
+            if bit:
+                self._kb_mods = (self._kb_mods & ~bit) if up else (self._kb_mods | bit)
+                self.on_key(vk, scan, extended, up)
+                passthrough = 1
+            elif not up and self._hotkey_chord(vk):
+                passthrough = 1
+            else:
+                self.on_key(vk, scan, extended, up)
+        except Exception:
+            passthrough = 1
+        if passthrough:
+            return user32.CallNextHookEx(None, n_code, wparam, lparam)
+        return 1
+
+    def _hotkey_chord(self, vk: int) -> bool:
+        """当前按下的修饰键是否正好构成配置的热键组合。"""
+        if vk != self.hotkey_vk:
+            return False
+        ctrl = bool(self._kb_mods & _KB_CTRL_BITS)
+        alt = bool(self._kb_mods & _KB_ALT_BITS)
+        shift = bool(self._kb_mods & _KB_SHIFT_BITS)
+        gui = bool(self._kb_mods & _KB_GUI_BITS)
+        return (
+            ctrl == bool(self.hotkey_mods & MOD_CONTROL)
+            and alt == bool(self.hotkey_mods & MOD_ALT)
+            and shift == bool(self.hotkey_mods & MOD_SHIFT)
+            and not gui
+        )
 
     # -- raw input -------------------------------------------------
     def _handle_raw_input(self, lparam) -> None:
@@ -477,6 +586,7 @@ class InputCapture:
         self._clip_anchor()
         user32.SetCursor(None)
         self.armed = True
+        self._kb_mods = 0
         self.on_toggle(True)
         if edge_mode:
             self.on_edge(self.edge, True)
@@ -511,6 +621,7 @@ class InputCapture:
             return
         self.armed = False
         self.edge_mode = False
+        self._kb_mods = 0
         user32.ClipCursor(None)
         if self._trap:
             user32.ShowWindow(self._trap, SW_HIDE)
@@ -541,6 +652,7 @@ class InputCapture:
             user32.ShowWindow(self._trap, SW_HIDE)
         if self.armed:
             self.armed = False
+            self._kb_mods = 0
             self.on_toggle(False)
         if self._hwnd:
             user32.PostMessageW(self._hwnd, WM_CLOSE, 0, 0)

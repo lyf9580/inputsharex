@@ -29,6 +29,19 @@ HID_KEYBOARD_ID = 2
 # 鼠标报文：buttons, dx, dy, wheel, pan
 MOUSE_REPORT_SIZE = 5
 
+# 键盘报文：modifiers, reserved, 6 个按键 usage（标准 6KRO）
+KEYBOARD_REPORT_SIZE = 8
+
+# 键盘报文第一字节的修饰键位
+KB_MOD_LEFT_CTRL = 0x01
+KB_MOD_LEFT_SHIFT = 0x02
+KB_MOD_LEFT_ALT = 0x04
+KB_MOD_LEFT_GUI = 0x08
+KB_MOD_RIGHT_CTRL = 0x10
+KB_MOD_RIGHT_SHIFT = 0x20
+KB_MOD_RIGHT_ALT = 0x40
+KB_MOD_RIGHT_GUI = 0x80
+
 BTN_LEFT = 0x01
 BTN_RIGHT = 0x02
 BTN_MIDDLE = 0x04
@@ -61,3 +74,11 @@ def mouse_reports(buttons: int, dx: int, dy: int, wheel: int = 0, pan: int = 0):
     if not out:
         out.append(mouse_report(buttons, 0, 0))
     return out
+
+
+def keyboard_report(modifiers: int = 0, keys=()) -> bytes:
+    """标准 6KRO 键盘报文：修饰键字节 + 保留字节 + 最多 6 个按键 usage。"""
+    pressed = [int(k) & 0xFF for k in list(keys)[:6] if 0 < int(k) < 0xE8]
+    while len(pressed) < 6:
+        pressed.append(0)
+    return bytes([modifiers & 0xFF, 0x00, *pressed])

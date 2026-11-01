@@ -1,7 +1,7 @@
 """桌面端 ↔ 安卓 App 的辅助通道。
 
 桌面端在本机 127.0.0.1:<port> 起一个 TCP server，再用 `adb reverse tcp:port tcp:port`
-把它映射到平板上的同一个端口；安卓 App 作为 client 连上来，双方用「一行一个 JSON」通信。
+把它映射到安卓端上的同一个端口；安卓 App 作为 client 连上来，双方用「一行一个 JSON」通信。
 
 用途：
 - 让手机端显示「已连接」、电脑名、实时延迟（ping/pong 往返）

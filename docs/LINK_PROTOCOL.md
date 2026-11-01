@@ -61,3 +61,11 @@
 - 电脑端拉起后连 `127.0.0.1:27184`，`hello` → 等 `welcome`，然后每 500ms `ping`；
 - 界面显示：已连接 / PC 名称 / RTT（ms，跟随 pong 更新）；
 - 连接失败不自动重连，服务保持“等待电脑连接”。
+
+## 剪贴板通道（scrcpy 3.3.3 控制 socket）
+
+- 控制 socket 建立后（`video=false` 时它就是服务端首个 socket），服务端先发 **1 字节 dummy + 64 字节设备名**，之后才是设备消息；PC 端由 `server._read_device_meta()` 读掉。
+- PC → 设备 `SET_CLIPBOARD`（type 9）：`u64 sequence` + `u8 paste` + `u32 UTF-8 字节数` + 文本；超过 262144 字节按 UTF-8 边界截断。
+- PC → 设备 `GET_CLIPBOARD`（type 8）：`u8 copy_key`。
+- 设备 → PC：`type 0 CLIPBOARD`（`u32 长度` + UTF-8）、`type 1 ACK_CLIPBOARD`（`u64 sequence`）、`type 2 UHID_OUTPUT`（`u16 id` + `u16 size` + data）。
+- 服务端启用 `clipboardAutosync` 时，设备剪贴板变化会主动发 type 0；PC 端以“最近一次同步文本”去重，避免两端来回写造成回环。

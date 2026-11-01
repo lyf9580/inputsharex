@@ -252,3 +252,54 @@ def test_android_config_invalid_placement_is_ignored():
     assert changed == []
     save.assert_not_called()
     value.device_link.send_config.assert_called_once()
+
+
+def test_arrow_switch_images_uses_swipe_when_enabled():
+    value = controller()
+    value.config = dict(value.config, arrow_switch_images=True)
+    value.session = Mock(closed=False)
+    value.session.swipe_horizontal = Mock(return_value=True)
+    value.session.keyboard_event = Mock()
+    value._screen_size = (1000, 2000)
+
+    value._on_key(0x27, 0x4D, True, False)  # VK_RIGHT 按下
+    value.session.swipe_horizontal.assert_called_once_with(forward=True)
+    value.session.keyboard_event.assert_not_called()
+
+    # 按住产生的重复 down 不应该连续翻页。
+    value._on_key(0x27, 0x4D, True, False)
+    assert value.session.swipe_horizontal.call_count == 1
+
+    # 松开后再次按下可以翻下一张。
+    value._on_key(0x27, 0x4D, True, True)
+    value._on_key(0x27, 0x4D, True, False)
+    assert value.session.swipe_horizontal.call_count == 2
+
+    # 左方向键是上一张。
+    value._on_key(0x25, 0x4B, True, False)
+    assert value.session.swipe_horizontal.call_args.kwargs["forward"] is False
+
+    # 非方向键仍然走 HID 键盘。
+    value._on_key(0x41, 0x1E, False, False)
+    value.session.keyboard_event.assert_called_once()
+
+
+def test_arrow_keys_stay_hid_when_switch_disabled_or_unknown_size():
+    value = controller()
+    value.config = dict(value.config, arrow_switch_images=False)
+    value.session = Mock(closed=False)
+    value.session.swipe_horizontal = Mock(return_value=True)
+    value.session.keyboard_event = Mock()
+    value._screen_size = (1000, 2000)
+
+    value._on_key(0x27, 0x4D, True, False)
+    value.session.keyboard_event.assert_called_once_with(0x27, 0x4D, True, False)
+    value.session.swipe_horizontal.assert_not_called()
+
+    # 开启但拿不到屏幕分辨率时回退普通方向键，避免手势落点错误。
+    value.config = dict(value.config, arrow_switch_images=True)
+    value._screen_size = None
+    value.session.keyboard_event.reset_mock()
+    value._on_key(0x25, 0x4B, True, False)
+    value.session.keyboard_event.assert_called_once_with(0x25, 0x4B, True, False)
+    value.session.swipe_horizontal.assert_not_called()

@@ -634,13 +634,13 @@ class EmptyState(QFrame):
         title.setProperty("role", "cardTitle")
         title.setAlignment(Qt.AlignHCenter)
         layout.addWidget(title)
-        desc = QLabel("确保平板已开启无线调试，且与本机在同一 Wi-Fi")
+        desc = QLabel("确保安卓端已开启无线调试，且与本机在同一 Wi-Fi")
         desc.setProperty("role", "dim")
         desc.setAlignment(Qt.AlignHCenter)
         desc.setWordWrap(True)
         layout.addWidget(desc)
         hint = QLabel(
-            "首次使用：平板「开发者选项 → 无线调试 → 使用配对码配对设备」，"
+            "首次使用：安卓端「开发者选项 → 无线调试 → 使用配对码配对设备」，"
             "配对后回到这里点「重新扫描」"
         )
         hint.setProperty("role", "faint")

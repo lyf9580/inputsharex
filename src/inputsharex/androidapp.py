@@ -1,6 +1,6 @@
 """安卓端配套 App 的检测与自动安装。
 
-配对/连接成功后，桌面端需要确认平板已经装了 ``com.inputsharex.app``：
+配对/连接成功后，桌面端需要确认安卓端已经装了 ``com.inputsharex.app``：
 辅助通道、共享状态和「下次连接自动开启共享」都依赖它。缺了就从打包的
 ``vendor/inputsharex-android.apk`` 自动装一份，避免用户重新找 APK 手动安装。
 
@@ -55,7 +55,7 @@ def parse_dumpsys(text: str) -> tuple[bool, str]:
 
 
 def installed_version(adb: Adb, serial: str) -> tuple[bool, str]:
-    """查询平板上是否装了配套 App；返回 (已安装, versionName)。"""
+    """查询安卓端是否装了配套 App；返回 (已安装, versionName)。"""
     try:
         proc = adb.run_for(serial, "shell", "dumpsys", "package", PACKAGE,
                            check=False, timeout=12)
@@ -103,7 +103,7 @@ def launch(adb: Adb, serial: str, *, log=None) -> bool:
 
 def ensure_installed(adb: Adb, serial: str, *, apk_path: str | None = None,
                      log=None, open_app: bool = True) -> bool:
-    """确保平板装有配套 App；缺了就从打包 APK 自动安装。
+    """确保安卓端装有配套 App；缺了就从打包 APK 自动安装。
 
     Returns:
         True 表示已安装（原本就有或刚装好）；False 表示检测/安装失败。

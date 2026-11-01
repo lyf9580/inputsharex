@@ -124,6 +124,28 @@ class ScrcpyServer:
             time.sleep(0.1)
         raise ServerError(f"连不上 scrcpy-server 控制端口 {self.local_port}: {last_error}")
 
+    def _read_device_meta(self, sock: socket.socket, consume_dummy: bool) -> None:
+        """读掉控制通道开头的握手数据。
+
+        video/audio 都关闭时，控制 socket 是服务端的"首个 socket"：
+        服务端会先发 1 字节 dummy（send_dummy_byte）和 64 字节设备名，
+        之后才是 CLIPBOARD/ACK/UHID_OUTPUT 等设备消息。不读掉的话，
+        剪贴板接收线程会把设备名当成消息类型（例如 '2'）导致会话被关闭。
+        """
+        total = (1 if consume_dummy else 0) + 64
+        sock.settimeout(5.0)
+        buf = b""
+        try:
+            while len(buf) < total:
+                chunk = sock.recv(total - len(buf))
+                if not chunk:
+                    break
+                buf += chunk
+        except OSError:
+            pass
+        finally:
+            sock.settimeout(None)
+
     # -- public ----------------------------------------------------
     def start(self) -> socket.socket:
         self.transport = "adb"
@@ -153,6 +175,7 @@ class ScrcpyServer:
                 os.path.join(os.path.dirname(self.jar_path), "inputsharex-relay.jar"))
             try:
                 self.sock = self.relay.start()
+                self._read_device_meta(self.sock, consume_dummy=True)
                 self.transport = "tls-direct"
                 return self.sock
             except (OSError, RuntimeError, ValueError, ImportError, subprocess.SubprocessError) as exc:
@@ -161,6 +184,7 @@ class ScrcpyServer:
                 self.direct = False
                 return self.start()
         self.sock = self._connect()
+        self._read_device_meta(self.sock, consume_dummy=False)
         return self.sock
 
     def stop(self) -> None:

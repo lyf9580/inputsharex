@@ -126,7 +126,7 @@ class PairDialog(QDialog):
         layout.setSpacing(12)
 
         steps = QLabel(
-            "1. 手机/平板打开 设置 → 开发者选项 → 无线调试；\n"
+            "1. 安卓端打开 设置 → 开发者选项 → 无线调试；\n"
             "2. 点「使用二维码配对设备」；\n"
             "3. 扫描下方二维码，扫码后保持此窗口打开。"
         )
@@ -172,7 +172,7 @@ class PairDialog(QDialog):
         layout.setSpacing(12)
 
         desc = QLabel(
-            "在手机/平板的「无线调试 → 使用配对码配对设备」中查看 IP、端口和 6 位配对码。"
+            "在安卓端的「无线调试 → 使用配对码配对设备」中查看 IP、端口和 6 位配对码。"
             "配对只需做一次，之后靠 mDNS 自动发现。"
         )
         desc.setProperty("role", "faint")
@@ -288,7 +288,7 @@ class PairDialog(QDialog):
         self._qr_started = True
         self.qr_label.setPixmap(pixmap)
         self.qr_regenerate_button.setEnabled(True)
-        self._set_qr_status("正在等待手机/平板扫描二维码…", "dim")
+        self._set_qr_status("正在等待安卓端扫描二维码…", "dim")
 
     def _on_qr_status(self, text: str) -> None:
         if self._finished:
@@ -362,7 +362,7 @@ class PairDialog(QDialog):
         port_text = self.port_edit.text().strip()
         code = self.code_edit.text().strip()
         if not ip or "." not in ip:
-            self._set_status("请填写手机/平板上显示的 IP 地址。", danger=True)
+            self._set_status("请填写安卓端上显示的 IP 地址。", danger=True)
             self.ip_edit.setFocus()
             return
         if not port_text.isdigit() or not (1 <= int(port_text) <= 65535):
@@ -374,7 +374,7 @@ class PairDialog(QDialog):
             self.code_edit.setFocus()
             return
         self._set_busy(True)
-        self._set_status("正在配对，请留意手机/平板上的提示…")
+        self._set_status("正在配对，请留意安卓端上的提示…")
         try:
             self.controller.pair(ip, int(port_text), code)
         except Exception as exc:  # 引擎异常直接展示

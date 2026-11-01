@@ -15,7 +15,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from . import __version__, link
+from . import __version__, clipboard, link
 from .adb import Adb, AdbError
 from .androidapp import (
     ensure_installed as ensure_android_app_installed,
@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "start_armed": False,
     "auto_connect": True,
     "double_trigger": False,
+    "arrow_switch_images": False,
     "placement": 0,
     "android_keep_awake": True,
     "lock_refresh": True,
@@ -147,6 +148,9 @@ class AppController(QObject):
         self._qr_thread: threading.Thread | None = None
         self._qr_watch_event: threading.Event | None = None
         self._qr_watch_thread: threading.Thread | None = None
+        self._screen_size: tuple[int, int] | None = None
+        self._clip_last = ""
+        self._arrow_pressed: set[int] = set()
 
         self._stats_timer = QTimer(self)
         self._stats_timer.timeout.connect(self._emit_stats)
@@ -485,7 +489,7 @@ class AppController(QObject):
                 threading.Timer(2.0, lambda: self.connect(serial)).start()
 
     def _ensure_android_app(self, serial: str) -> None:
-        """连接后确认平板装有配套 App；缺了自动安装（失败不影响键鼠共享）。"""
+        """连接后确认安卓端装有配套 App；缺了自动安装（失败不影响键鼠共享）。"""
         try:
             ensure_android_app_installed(self.adb, serial, log=self._log)
         except Exception as exc:  # 自动安装是增强能力，不能拖垮连接流程
@@ -600,6 +604,12 @@ class AppController(QObject):
                 self._log(f"加密直连暂不可用，已回退 ADB：{server.direct_error}")
             session = ControlSession(sock, keepalive_interval=interval, cadence_ms=cadence)
             self.session = session
+            self._clip_last = ""
+            self._arrow_pressed.clear()
+            self._screen_size = self._android_screen_size()
+            if self._screen_size:
+                session.set_screen_size(*self._screen_size)
+            session.on_clipboard = self._on_device_clipboard
             session.create_mouse("inputsharex")
             session.create_keyboard("inputsharex")
             session.start()
@@ -624,6 +634,7 @@ class AppController(QObject):
                 on_button=lambda buttons: session.mouse_button(buttons),
                 on_wheel=lambda v, h: session.scroll(v, h),
                 on_key=self._on_key,
+                on_clipboard=self._on_windows_clipboard,
                 on_toggle=self._on_arm_toggle,
                 on_edge=self._on_edge,
                 hotkey_mods=mods,
@@ -659,6 +670,9 @@ class AppController(QObject):
                 self._set_state("connected" if self.serial else "idle")
 
     def _teardown_sharing(self) -> None:
+        self._clip_last = ""
+        self._screen_size = None
+        self._arrow_pressed.clear()
         if self.capture is not None:
             try:
                 self.capture.stop()
@@ -702,6 +716,8 @@ class AppController(QObject):
         self._capture_generation = time.time_ns()
         if self.pointer_monitor:
             self.pointer_monitor.set_enabled(armed, self._capture_generation, self.config.get("placement", 0))
+        if not armed:
+            self._arrow_pressed.clear()
         if not armed and self.session is not None:
             # 切回电脑时清掉安卓端所有按键状态，避免 Ctrl/Shift 或字符卡住。
             try:
@@ -710,7 +726,7 @@ class AppController(QObject):
                 pass
         self._publish_sharing_state()
         if armed:
-            self._log("鼠标已切换到平板（移动回原侧边缘可切回）")
+            self._log("鼠标已切换到安卓端（移动回原侧边缘可切回）")
         else:
             self._log("鼠标已切回电脑")
 
@@ -720,14 +736,88 @@ class AppController(QObject):
         if session is None or session.closed:
             return
         try:
+            # 图文切换模式：方向键左右改成横向滑动，不再发方向键（抖音图文用）。
+            if (self.config.get("arrow_switch_images", False) and vk in (0x25, 0x27)
+                    and self._screen_size):
+                if up:
+                    self._arrow_pressed.discard(vk)
+                    return
+                if vk in self._arrow_pressed:
+                    return
+                self._arrow_pressed.add(vk)
+                session.swipe_horizontal(forward=(vk == 0x27))
+                return
             session.keyboard_event(vk, scan, extended, up)
         except Exception:
             pass
 
+    def _on_windows_clipboard(self, text: str) -> None:
+        """电脑剪贴板变化：同步到安卓端。"""
+        if not text or text == self._clip_last:
+            return
+        session = self.session
+        if session is None or session.closed:
+            return
+        try:
+            if session.set_clipboard_text(text):
+                self._clip_last = text
+        except Exception:
+            pass
+
+    def _on_device_clipboard(self, text: str) -> None:
+        """安卓端剪贴板变化：写回电脑剪贴板。"""
+        if not text or text == self._clip_last:
+            return
+        try:
+            if clipboard.write_text(text):
+                self._clip_last = text
+                self._log("已从安卓端同步剪贴板")
+        except Exception:
+            pass
+
+    def _android_screen_size(self) -> tuple[int, int] | None:
+        """安卓端当前逻辑分辨率（图文切换手势用）；拿不到返回 None。"""
+        serial = self.serial
+        if not serial:
+            return None
+        width = height = 0
+        try:
+            text = self.adb.run_for(serial, "shell", "wm", "size", check=False,
+                                    timeout=10).stdout.decode("utf-8", "replace")
+        except Exception:
+            text = ""
+        override = physical = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("Override size:"):
+                override = line.split(":", 1)[1].strip()
+            elif line.startswith("Physical size:"):
+                physical = line.split(":", 1)[1].strip()
+        raw = override or physical
+        if "x" in raw:
+            try:
+                w, h = raw.lower().split("x", 1)
+                width, height = int(w), int(h)
+            except ValueError:
+                width = height = 0
+        if width <= 0 or height <= 0:
+            return None
+        rotated = False
+        try:
+            dump = self.adb.run_for(serial, "shell", "dumpsys", "input", check=False,
+                                    timeout=10).stdout.decode("utf-8", "replace")
+            for line in dump.splitlines():
+                if "SurfaceOrientation" in line:
+                    rotated = line.rsplit(":", 1)[-1].strip() in ("1", "3")
+                    break
+        except Exception:
+            pass
+        return (height, width) if rotated else (width, height)
+
     def _on_edge(self, edge: int, entered: bool) -> None:
         names = {0: "右", 1: "左", 2: "下", 3: "上"}
         side = names.get(int(edge), str(edge))
-        self._log(f"边缘切换：{side}侧 → 平板" if entered else f"边缘切换：{side}侧 → 电脑")
+        self._log(f"边缘切换：{side}侧 → 安卓端" if entered else f"边缘切换：{side}侧 → 电脑")
 
     def toggle_armed(self) -> None:
         if self.capture is None:
@@ -789,7 +879,7 @@ class AppController(QObject):
 
     # -- 二维码配对 ------------------------------------------------
     def start_qr_pairing(self) -> dict:
-        """生成一次二维码配对凭据并开始等待平板扫码。
+        """生成一次二维码配对凭据并开始等待安卓端扫码。
 
         返回 {"name", "password", "payload"}，供界面绘制二维码。
         """

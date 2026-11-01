@@ -4,11 +4,11 @@
 
 1. 电脑生成随机服务名与配对密码，二维码内容为
    ``WIFI:T:ADB;S:<服务名>;P:<密码>;;``；
-2. 平板在「开发者选项 → 无线调试 → 使用二维码配对设备」中扫码，
+2. 安卓端在「开发者选项 → 无线调试 → 使用二维码配对设备」中扫码，
    随后以该服务名广播 ``_adb-tls-pairing._tcp``；
 3. 电脑用 ``adb mdns services`` 发现该服务，执行
    ``adb pair <ip:端口> <密码>``；
-4. 平板再广播 ``_adb-tls-connect._tcp``，电脑 ``adb connect`` 完成接入。
+4. 安卓端再广播 ``_adb-tls-connect._tcp``，电脑 ``adb connect`` 完成接入。
 
 这里不依赖 Qt，便于单元测试；Qt 侧只负责显示二维码和进度。
 """
@@ -260,7 +260,7 @@ class QrPairing:
     def _run(self) -> PairResult:
         if self.cancelled:
             return PairResult(False, "", "已取消配对。")
-        self._status("正在等待手机/平板扫描二维码…")
+        self._status("正在等待安卓端扫描二维码…")
         pairing_addr = self._wait_endpoint(
             PAIRING_SERVICE, name=self.name, timeout=self.pairing_timeout
         )
@@ -270,7 +270,7 @@ class QrPairing:
             return PairResult(
                 False,
                 "",
-                "等待超时：没有发现手机/平板的配对请求。请确认手机/平板和电脑在同一 Wi-Fi，"
+                "等待超时：没有发现安卓端的配对请求。请确认安卓端和电脑在同一 Wi-Fi，"
                 "并在「无线调试 → 使用二维码配对设备」中重新扫码。",
             )
         if self.cancelled:

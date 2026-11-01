@@ -39,7 +39,7 @@ from inputsharex.ui_theme import DARK, LIGHT, current_theme  # noqa: E402
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="inputsharex-gui",
-        description="输入流转X：把 Windows 键鼠共享给安卓平板",
+        description="输入流转X：把 Windows 键鼠共享给安卓端",
     )
     parser.add_argument("--minimized", action="store_true", help="启动后只显示托盘图标")
     parser.add_argument("--start-sharing", action="store_true", help="启动后立即开始共享（默认即开启）")

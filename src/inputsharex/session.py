@@ -7,12 +7,13 @@
    位移合并成「一次 sendall、多帧 HID」。原来每个鼠标事件一个 TCP 包
    （125-1000 包/秒），现在最多 250 包/秒，无线空口开销显著下降。
 3. 保活与输入共用一条连接、同一个发送线程：空闲超过 keepalive_interval
-   就补一帧零位移，避免平板 Wi-Fi 空闲省电把下行包缓存到下次 DTIM。
+   就补一帧零位移，避免安卓端 Wi-Fi 空闲省电把下行包缓存到下次 DTIM。
 """
 from __future__ import annotations
 
 import math
 import socket
+import struct
 import threading
 import time
 
@@ -86,6 +87,14 @@ class ControlSession:
         self._latency_samples: list[float] = []
         self._kb_mods = 0
         self._kb_keys: list[int] = []
+        # 剪贴板同步：设备端变化回调 on_clipboard(text)，收到 SET_CLIPBOARD 的 ACK 回调
+        # on_clipboard_ack(sequence)。设备端消息由独立接收线程解析。
+        self.on_clipboard = None
+        self.on_clipboard_ack = None
+        self._recv_thread: threading.Thread | None = None
+        self._recv_buffer = bytearray()
+        self._clip_sequence = 0
+        self._screen_size: tuple[int, int] | None = None
         try:
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
@@ -242,6 +251,113 @@ class ControlSession:
             self.sent_bytes += len(payload)
             self.sent_messages += 1
 
+    # -- 剪贴板同步 ------------------------------------------------
+    def set_screen_size(self, width: int, height: int) -> None:
+        """记录安卓当前逻辑分辨率（横屏时宽高已互换），供手势注入使用。"""
+        if width > 0 and height > 0:
+            self._screen_size = (int(width), int(height))
+
+    def set_clipboard_text(self, text: str, paste: bool = False) -> bool:
+        """把电脑端剪贴板文本写到安卓端。返回是否真的发出。"""
+        if self._closed:
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            self._clip_sequence += 1
+            payload = protocol.set_clipboard(text, paste, self._clip_sequence)
+            self._send_locked(payload)
+            self.sent_bytes += len(payload)
+            self.sent_messages += 1
+            return True
+
+    def request_clipboard(self, copy_key: int = 0) -> None:
+        self.send(protocol.get_clipboard(copy_key))
+
+    def _recv_loop(self) -> None:
+        while not self._closed:
+            try:
+                data = self.sock.recv(4096)
+            except OSError:
+                self._closed = True
+                return
+            if not data:
+                self._closed = True
+                return
+            self._recv_buffer += data
+            try:
+                self._drain_device_messages()
+            except Exception:
+                self._closed = True
+                return
+
+    def _drain_device_messages(self) -> None:
+        """解析设备端消息：0=剪贴板文本(4字节长度+UTF-8)、1=ACK(8字节序号)、2=UHID 输出。"""
+        buf = self._recv_buffer
+        while buf:
+            kind = buf[0]
+            if kind == protocol.DEVICE_MSG_CLIPBOARD:
+                if len(buf) < 5:
+                    return
+                length = struct.unpack(">I", bytes(buf[1:5]))[0]
+                if len(buf) < 5 + length:
+                    return
+                raw = bytes(buf[5:5 + length])
+                del buf[:5 + length]
+                text = raw.decode("utf-8", "replace")
+                if self.on_clipboard is not None:
+                    self.on_clipboard(text)
+            elif kind == protocol.DEVICE_MSG_ACK_CLIPBOARD:
+                if len(buf) < 9:
+                    return
+                sequence = struct.unpack(">Q", bytes(buf[1:9]))[0]
+                del buf[:9]
+                if self.on_clipboard_ack is not None:
+                    self.on_clipboard_ack(sequence)
+            elif kind == protocol.DEVICE_MSG_UHID_OUTPUT:
+                if len(buf) < 5:
+                    return
+                size = struct.unpack(">H", bytes(buf[3:5]))[0]
+                if len(buf) < 5 + size:
+                    return
+                del buf[:5 + size]
+            else:
+                # 未知消息无法确定长度，继续读只会错位；直接结束会话。
+                raise ValueError(f"unknown device message type: {kind}")
+
+    # -- 手势（图文左右切换） --------------------------------------
+    def swipe_horizontal(self, forward: bool, steps: int = 8, interval: float = 0.012) -> bool:
+        """在安卓当前界面上做一次水平滑动。forward=True 表示"下一张"（手指向左滑）。
+
+        使用 scrcpy 的 INJECT_TOUCH_EVENT：pointer_id=0 会被服务端当作手指触摸，
+        而不是鼠标事件，因此能被 ViewPager/抖音图文识别成翻页手势。
+        """
+        if self._closed:
+            return False
+        size = self._screen_size
+        if not size:
+            return False
+        width, height = size
+        y = height // 2
+        left = int(width * 0.22)
+        right = int(width * 0.78)
+        if forward:
+            x_start, x_end = right, left
+        else:
+            x_start, x_end = left, right
+        pid = 0
+        self.send(protocol.inject_touch(0, pid, x_start, y, width, height,
+                                        pressure=0xFFFF, action_button=0, buttons=0))
+        for i in range(1, steps):
+            t = i / steps
+            x = int(round(x_start + (x_end - x_start) * t))
+            self.send(protocol.inject_touch(2, pid, x, y, width, height,
+                                            pressure=0xFFFF, action_button=0, buttons=0))
+            time.sleep(interval)
+        self.send(protocol.inject_touch(1, pid, x_end, y, width, height,
+                                        pressure=0, action_button=0, buttons=0))
+        return True
+
     # -- 合并发送线程 ----------------------------------------------
     def set_keepalive(self, keepalive_ms: float) -> None:
         self.keepalive_interval = max(0.0, keepalive_ms) / 1000.0
@@ -254,6 +370,11 @@ class ControlSession:
             return
         self._thread = threading.Thread(target=self._loop, name="control-sender", daemon=True)
         self._thread.start()
+        if self._recv_thread is None or not self._recv_thread.is_alive():
+            self._recv_thread = threading.Thread(
+                target=self._recv_loop, name="control-recv", daemon=True
+            )
+            self._recv_thread.start()
 
     def start_keepalive(self) -> None:  # 兼容旧接口
         self.start()

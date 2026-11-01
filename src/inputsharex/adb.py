@@ -186,7 +186,7 @@ class Adb:
                 time.sleep(0.5)
             time.sleep(1.0)
         raise AdbError(
-            "没有发现可连接的无线调试设备：确认平板已开“无线调试”、"
+            "没有发现可连接的无线调试设备：确认安卓端已开“无线调试”、"
             "且这台电脑之前和它配对过"
             + (f"；最近错误：{last_error}" if last_error else "")
         )

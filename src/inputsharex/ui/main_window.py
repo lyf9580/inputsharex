@@ -49,10 +49,10 @@ from .widgets import (
 _SUBTITLES = {
     "starting": "正在准备共享通道…",
     "idle": "等待连接安卓设备",
-    "discovering": "正在搜索局域网内的平板…",
+    "discovering": "正在搜索局域网内的安卓端…",
     "connecting": "正在建立 adb 连接…",
     "connected": "连接成功，可以开始共享",
-    "sharing": "输入已接管 · 键鼠直接流向平板",
+    "sharing": "输入已接管 · 键鼠直接流向安卓端",
     "error": "连接出错，请检查 adb 与网络",
 }
 
@@ -67,9 +67,9 @@ _PLACEMENTS = ((0, "右侧"), (1, "左侧"), (2, "下方"), (3, "上方"))
 
 
 def _subtitle_for(state: str, armed: bool) -> str:
-    """共享已开启但还没接管时，提示怎么进平板；接管后说明键鼠已流向平板。"""
+    """共享已开启但还没接管时，提示怎么进安卓端；接管后说明键鼠已流向安卓端。"""
     if state == "sharing":
-        return "输入已接管 · 键鼠直接流向平板" if armed else "共享已开启 · 推到屏幕边缘或按热键接管"
+        return "输入已接管 · 键鼠直接流向安卓端" if armed else "共享已开启 · 推到屏幕边缘或按热键接管"
     return _SUBTITLES.get(state, _SUBTITLES["idle"])
 
 
@@ -217,7 +217,7 @@ class MainWindow(QMainWindow):
         self.header_name.setProperty("role", "deviceName")
         self.header_name.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.header_name.setMaximumWidth(300)
-        self.header_addr = QLabel("连接平板后在这里显示")
+        self.header_addr = QLabel("连接安卓端后在这里显示")
         self.header_addr.setProperty("role", "deviceAddr")
         self.header_addr.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.header_addr.setMaximumWidth(300)
@@ -263,7 +263,7 @@ class MainWindow(QMainWindow):
         self.pair_button = QPushButton("配对…")
         self.pair_button.setObjectName("GhostButton")
         self.pair_button.setCursor(Qt.PointingHandCursor)
-        self.pair_button.setToolTip("首次连接时，用平板无线调试里的配对码完成配对")
+        self.pair_button.setToolTip("首次连接时，用安卓端无线调试里的配对码完成配对")
         self.pair_button.clicked.connect(self._open_pair_dialog)
         bar.addWidget(self.pair_button)
         self.refresh_button = QPushButton("重新扫描")
@@ -376,14 +376,14 @@ class MainWindow(QMainWindow):
         self.auto_connect_switch = self._new_switch()
         link_card.add_row("自动连接", "发现已配对设备后自动建立连接", self.auto_connect_switch)
         self.keep_awake_switch = self._new_switch()
-        link_card.add_row("保持平板常亮", "共享期间阻止平板自动息屏", self.keep_awake_switch)
+        link_card.add_row("保持安卓端常亮", "共享期间阻止安卓端自动息屏", self.keep_awake_switch)
         layout.addWidget(link_card)
 
         mouse = Card("鼠标控制", "指针接管与触控映射")
         self.edge_switch = self._new_switch()
         mouse.add_row(
             "边缘切换",
-            "指针碰到屏幕边缘时把焦点交给平板（需已连接）",
+            "指针碰到屏幕边缘时把焦点交给安卓端（需已连接）",
             self.edge_switch,
         )
         self.double_combo = QComboBox()
@@ -397,12 +397,18 @@ class MainWindow(QMainWindow):
         self.placement_combo = QComboBox()
         for value, label in _PLACEMENTS:
             self.placement_combo.addItem(label, value)
-        mouse.add_row("平板放置方向", "平板位于电脑的哪一侧，决定边缘切换方向", self.placement_combo)
+        mouse.add_row("安卓端放置方向", "安卓端位于电脑的哪一侧，决定边缘切换方向", self.placement_combo)
         self.lock_refresh_switch = self._new_switch()
         mouse.add_row(
             "锁定高刷新率（实验）",
             "安卓端用透明覆盖层向系统申请 120Hz，让抖音等视频 App 前台也保持高刷；需要新版安卓 App，略增耗电",
             self.lock_refresh_switch,
+        )
+        self.arrow_images_switch = self._new_switch()
+        mouse.add_row(
+            "方向键左右切换图文",
+            "抖音图文里按 ←/→ 切换上一张/下一张图片；关闭时发送普通方向键（打字、视频快进用）",
+            self.arrow_images_switch,
         )
         layout.addWidget(mouse)
 
@@ -430,8 +436,8 @@ class MainWindow(QMainWindow):
         column.addWidget(make_label("输入流转X", "section"))
         column.addWidget(make_label(f"版本 v{self._version} · Windows 10 / 11", "dim"))
         desc = make_label(
-            "把 Windows 的键盘鼠标通过 adb + scrcpy UHID 共享给安卓平板，"
-            "数据只在本机与平板之间传输。",
+            "把 Windows 的键盘鼠标通过 adb + scrcpy UHID 共享给安卓端，"
+            "数据只在本机与安卓端之间传输。",
             "faint",
         )
         desc.setWordWrap(True)
@@ -476,17 +482,17 @@ class MainWindow(QMainWindow):
         help_card = Card("故障排查", "按顺序检查，仍未解决请看运行日志")
         help_card.add_row(
             "1. 打开无线调试",
-            "设置 → 关于平板电脑 → 连续点击「版本号」7 次，"
+            "设置 → 关于本机（部分系统为「关于手机」）→ 连续点击「版本号」7 次，"
             "再进入「开发者选项 → 无线调试」并打开。",
         )
         help_card.add_row(
             "2. 同一 Wi-Fi 与 mDNS",
-            "电脑和平板需要处于同一网段；路由器开启 AP 隔离或使用访客网络时，"
+            "电脑和安卓端需要处于同一网段；路由器开启 AP 隔离或使用访客网络时，"
             "设备发现会失败。",
         )
         help_card.add_row(
             "3. 配对",
-            "首次连接需在平板「无线调试 → 使用配对码配对设备」查看 IP、端口和 6 位配对码，"
+            "首次连接需在安卓端「无线调试 → 使用配对码配对设备」查看 IP、端口和 6 位配对码，"
             "回到设备页点「配对…」输入。",
         )
         help_card.add_row(
@@ -545,7 +551,7 @@ class MainWindow(QMainWindow):
             addr = "已连接"
         else:
             name = "未选择设备"
-            addr = "连接平板后在这里显示"
+            addr = "连接安卓端后在这里显示"
         self.header_name.setText(name)
         transport = self._stats.get("transport_label", "")
         self.header_addr.setText(f"{transport} · {addr}" if transport else addr)
@@ -867,6 +873,7 @@ class MainWindow(QMainWindow):
         self.keep_awake_switch.set_checked_silently(bool(config.get("android_keep_awake", True)))
         self.edge_switch.set_checked_silently(bool(config.get("edge_switch", True)))
         self.lock_refresh_switch.set_checked_silently(bool(config.get("lock_refresh", False)))
+        self.arrow_images_switch.set_checked_silently(bool(config.get("arrow_switch_images", False)))
         self.double_combo.setCurrentIndex(1 if bool(config.get("double_trigger", False)) else 0)
         try:
             autostart_enabled = autostart.is_enabled()
@@ -891,6 +898,9 @@ class MainWindow(QMainWindow):
         self.edge_switch.toggled.connect(lambda checked: self._save(edge_switch=checked))
         self.lock_refresh_switch.toggled.connect(
             lambda checked: self._save(lock_refresh=checked)
+        )
+        self.arrow_images_switch.toggled.connect(
+            lambda checked: self._save(arrow_switch_images=checked)
         )
         self.double_combo.currentIndexChanged.connect(
             lambda _index: self._save(double_trigger=bool(self.double_combo.currentData()))

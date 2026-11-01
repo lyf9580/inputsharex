@@ -27,6 +27,11 @@ START_APP = 16
 RESET_VIDEO = 17
 
 
+DEVICE_MSG_CLIPBOARD = 0
+DEVICE_MSG_ACK_CLIPBOARD = 1
+DEVICE_MSG_UHID_OUTPUT = 2
+
+
 def _u8(v: int) -> bytes:
     return struct.pack(">B", v & 0xFF)
 
@@ -121,12 +126,21 @@ def set_display_power(on: bool) -> bytes:
     return _u8(SET_DISPLAY_POWER) + _u8(1 if on else 0)
 
 
+# scrcpy 3.3.3 的 SET_CLIPBOARD 文本长度是 4 字节（write_string），不是 1 字节。
+CLIPBOARD_TEXT_MAX_BYTES = 262144  # 与服务端 SC_CONTROL_MSG_CLIPBOARD_TEXT_MAX_LENGTH 对齐
+
+
 def set_clipboard(text: str, paste: bool = False, sequence: int = 0) -> bytes:
+    raw = text.encode("utf-8")
+    if len(raw) > CLIPBOARD_TEXT_MAX_BYTES:
+        # 截断必须落在 UTF-8 字符边界上，否则安卓端解码会得到替换字符。
+        raw = raw[:CLIPBOARD_TEXT_MAX_BYTES].decode("utf-8", "ignore").encode("utf-8")
     return (
         _u8(SET_CLIPBOARD)
         + _u64(sequence)
         + _u8(1 if paste else 0)
-        + _string(text, 1)
+        + _u32(len(raw))
+        + raw
     )
 
 

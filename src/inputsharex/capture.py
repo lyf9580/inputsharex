@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import ctypes
 import threading
+import time
 import uuid
 from ctypes import wintypes
 
+from . import clipboard
 from .keyboard import modifier_bit as _modifier_bit
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -30,6 +32,7 @@ WM_HOTKEY = 0x0312
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
 WM_SETCURSOR = 0x0020
+WM_CLIPBOARDUPDATE = 0x031D
 
 # 低级键盘钩子：接管时把 PC 键盘事件转发给安卓，并拦下本地按键。
 WH_KEYBOARD_LL = 13
@@ -243,6 +246,10 @@ user32.DestroyWindow.restype = wintypes.BOOL
 user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
 user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.AddClipboardFormatListener.argtypes = [wintypes.HWND]
+user32.AddClipboardFormatListener.restype = wintypes.BOOL
+user32.RemoveClipboardFormatListener.argtypes = [wintypes.HWND]
+user32.RemoveClipboardFormatListener.restype = wintypes.BOOL
 
 
 class WNDCLASSW(ctypes.Structure):
@@ -278,14 +285,14 @@ def _monitor_rect(x: int, y: int) -> tuple[int, int, int, int]:
 
 
 class InputCapture:
-    """后台消息窗口线程：捕获鼠标原始位移/按键，按需转发给平板。
+    """后台消息窗口线程：捕获鼠标原始位移/按键，按需转发给安卓端。
 
     回调：on_move(dx, dy, buttons) / on_button(buttons) / on_wheel(v, h) /
           on_toggle(armed) / on_edge(edge, entered)
     """
 
     def __init__(self, on_move=None, on_button=None, on_wheel=None, on_toggle=None,
-                 on_edge=None, on_key=None,
+                 on_edge=None, on_key=None, on_clipboard=None,
                  hotkey_mods: int = MOD_CONTROL | MOD_ALT, hotkey_vk: int = VK_Q,
                  edge_switch: bool = True, edge: int = EDGE_RIGHT, edge_zone: int = 6,
                  return_px: int = 96):
@@ -295,6 +302,7 @@ class InputCapture:
         self.on_toggle = on_toggle or (lambda armed: None)
         self.on_edge = on_edge or (lambda edge, entered: None)
         self.on_key = on_key or (lambda vk, scan, extended, up: None)
+        self.on_clipboard = on_clipboard or (lambda text: None)
         self.can_capture = lambda: True
         self.hotkey_mods = hotkey_mods
         self.hotkey_vk = hotkey_vk
@@ -340,6 +348,9 @@ class InputCapture:
             0, self._class_names[0], "inputsharex", 0, 0, 0, 0, 0, None, None, hinstance, None
         )
         self._hwnd = hwnd
+        # 剪贴板变化监听：双向同步用（只需要文本变化通知）
+        if not user32.AddClipboardFormatListener(hwnd):
+            print("[!] AddClipboardFormatListener 失败，剪贴板同步不可用")
         # 陷阱窗口：接管时贴在锚点上的 4x4 置顶窗口，光标被 ClipCursor 关在里面，
         # 并在 WM_SETCURSOR 里返回空光标 → 用户看不到鼠标。
         self._trap = user32.CreateWindowExW(
@@ -356,7 +367,7 @@ class InputCapture:
         try:
             self._hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_ref(), hinstance, 0)
             if not self._hook:
-                print("[!] 键盘钩子安装失败，键盘不会转发到平板")
+                print("[!] 键盘钩子安装失败，键盘不会转发到安卓端")
         except Exception:
             self._hook = None
         self._ready.set()
@@ -372,6 +383,10 @@ class InputCapture:
                 pass
             self._hook = None
         user32.UnregisterHotKey(hwnd, 1)
+        try:
+            user32.RemoveClipboardFormatListener(hwnd)
+        except Exception:
+            pass
         if self._trap:
             user32.DestroyWindow(self._trap)
             self._trap = None
@@ -390,6 +405,8 @@ class InputCapture:
                 self._handle_raw_input(lparam)
             elif msg == WM_HOTKEY:
                 self.toggle()
+            elif msg == WM_CLIPBOARDUPDATE:
+                self._handle_clipboard_update()
             elif msg == WM_SETCURSOR and hwnd == self._trap:
                 # 陷阱窗口不画光标：这是"看不到鼠标"的关键
                 user32.SetCursor(None)
@@ -399,6 +416,23 @@ class InputCapture:
         except Exception:
             pass
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    # -- 剪贴板 -----------------------------------------------------
+    def _handle_clipboard_update(self) -> None:
+        """剪贴板内容变化：读文本交给上层同步。
+
+        WM_CLIPBOARDUPDATE 到达时剪贴板可能还在更新（格式或数据尚未就绪），
+        单次读取会拿到空串，所以短暂重试几次。
+        """
+        for _ in range(6):
+            try:
+                text = clipboard.read_text()
+            except Exception:
+                text = ""
+            if text:
+                self.on_clipboard(text)
+                return
+            time.sleep(0.02)
 
     # -- 键盘转发 ---------------------------------------------------
     def _hook_ref(self):
@@ -541,7 +575,7 @@ class InputCapture:
             self._return_to_pc()
 
     def _return_to_pc(self) -> None:
-        """从平板切回电脑：光标出现在原来那侧显示器边缘的内侧。"""
+        """从安卓端切回电脑：光标出现在原来那侧显示器边缘的内侧。"""
         ax, ay = self._anchor
         left, top, right, bottom = _monitor_rect(ax, ay)
         m = 48

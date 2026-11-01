@@ -1,5 +1,6 @@
 package com.inputsharex.app.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -16,6 +17,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.inputsharex.app.link.APP_VERSION
@@ -81,8 +83,34 @@ fun AboutScreen() {
             }
         }
 
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = MaterialTheme.shapes.large,
+        ) {
+            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("关于项目", style = MaterialTheme.typography.titleMedium)
+                val uriHandler = LocalUriHandler.current
+                Text(
+                    "GitHub：github.com/lyf9580/inputsharex",
+                    modifier = Modifier.clickable {
+                        uriHandler.openUri("https://github.com/lyf9580/inputsharex")
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                InfoRow("开源许可", "Unlicense（可商用、无需署名）")
+                Text(
+                    "本项目以 Unlicense 协议开源：可自由使用、修改与商用，无需标注来源。" +
+                        "启动时会检查 GitHub 上的新版本，有更新会提示下载到系统「下载」目录。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
         Text(
-            "© 2025 InputShareX · 开源项目",
+            "© 2025 InputShareX · Unlicense 开源项目",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

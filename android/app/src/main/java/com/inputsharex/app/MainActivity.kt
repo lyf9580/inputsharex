@@ -1,7 +1,16 @@
 package com.inputsharex.app
 
+import android.app.AlertDialog
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -10,8 +19,12 @@ import com.inputsharex.app.data.SettingsStore
 import com.inputsharex.app.service.LinkService
 import com.inputsharex.app.ui.AppRoot
 import com.inputsharex.app.ui.InputShareXTheme
+import com.inputsharex.app.update.UpdateChecker
+import com.inputsharex.app.update.UpdateInfo
 
 class MainActivity : ComponentActivity() {
+    private var pendingDownloadId: Long = -1L
+    private var downloadReceiver: BroadcastReceiver? = null
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         SettingsStore.init(this)
@@ -28,6 +41,13 @@ class MainActivity : ComponentActivity() {
         }
         handleExperimentIntent(intent)
         handleConnectIntent(intent)
+        maybeCheckForUpdates()
+    }
+
+    override fun onDestroy() {
+        downloadReceiver?.let { runCatching { unregisterReceiver(it) } }
+        downloadReceiver = null
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -73,6 +93,98 @@ class MainActivity : ComponentActivity() {
         val serviceIntent = Intent(this, LinkService::class.java).setAction(action)
         extras?.let { serviceIntent.putExtras(it) }
         ContextCompat.startForegroundService(this, serviceIntent)
+    }
+
+    /** 启动时静默检查 GitHub 是否有新版安卓端，有则弹窗提示下载。 */
+    private fun maybeCheckForUpdates() {
+        UpdateChecker.check { info ->
+            if (info == null) return@check
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) showUpdateDialog(info)
+            }
+        }
+    }
+
+    private fun showUpdateDialog(info: UpdateInfo) {
+        val notes = info.notes.trim().take(600)
+        val message = buildString {
+            append("发现新版本 ").append(info.version)
+            append("（当前 ").append(BuildConfig.VERSION_NAME).append("）。")
+            if (notes.isNotEmpty()) {
+                append("\n\n").append(notes)
+            }
+            append("\n\n更新包会下载到系统的「下载」目录，完成后点按通知即可安装。")
+        }
+        AlertDialog.Builder(this)
+            .setTitle("发现新版本")
+            .setMessage(message)
+            .setPositiveButton("下载更新") { _, _ -> startUpdateDownload(info) }
+            .setNegativeButton("稍后", null)
+            .show()
+    }
+
+    private fun startUpdateDownload(info: UpdateInfo) {
+        if (info.assetUrl.isBlank()) {
+            Toast.makeText(this, "该版本没有安卓安装包", Toast.LENGTH_SHORT).show()
+            return
+        }
+        runCatching { UpdateChecker.download(this, info) }
+            .onSuccess { id ->
+                pendingDownloadId = id
+                registerDownloadReceiver()
+                Toast.makeText(this, "已开始下载到「下载」目录", Toast.LENGTH_SHORT).show()
+            }
+            .onFailure {
+                Toast.makeText(this, "下载失败：${it.message}", Toast.LENGTH_LONG).show()
+            }
+    }
+
+    private fun registerDownloadReceiver() {
+        if (downloadReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
+                val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+                if (id != pendingDownloadId) return
+                pendingDownloadId = -1L
+                installDownloaded(id)
+            }
+        }
+        downloadReceiver = receiver
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(receiver, filter)
+        }
+    }
+
+    private fun installDownloaded(downloadId: Long) {
+        val uri = UpdateChecker.downloadedUri(this, downloadId)
+        if (uri == null) {
+            Toast.makeText(this, "下载完成，请到「下载」目录手动安装", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !packageManager.canRequestPackageInstalls()
+        ) {
+            Toast.makeText(this, "请允许安装未知来源应用后再安装", Toast.LENGTH_LONG).show()
+            runCatching {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:$packageName"),
+                    )
+                )
+            }
+            return
+        }
+        val install = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { startActivity(install) }
+            .onFailure { Toast.makeText(this, "无法打开安装器：${it.message}", Toast.LENGTH_LONG).show() }
     }
 
     companion object {

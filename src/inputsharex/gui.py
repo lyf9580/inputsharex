@@ -44,6 +44,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--minimized", action="store_true", help="启动后只显示托盘图标")
     parser.add_argument("--start-sharing", action="store_true", help="启动后立即开始共享（默认即开启）")
     parser.add_argument("--no-share", action="store_true", help="启动后只连接、不开始共享")
+    parser.add_argument(
+        "--no-update-check", action="store_true", help="启动时不检查 GitHub 更新"
+    )
     parser.add_argument("--light", action="store_true", help="强制使用浅色主题")
     parser.add_argument("--dark", action="store_true", help="强制使用深色主题")
     parser.add_argument(
@@ -98,7 +101,12 @@ def main(argv: list[str] | None = None) -> int:
         QMessageBox.critical(None, "输入流转X", f"初始化失败：\n{exc}")
         return 1
 
-    window = MainWindow(controller, version=__version__, theme=theme)
+    window = MainWindow(
+        controller,
+        version=__version__,
+        theme=theme,
+        check_updates=not args.no_update_check,
+    )
     instance.bind_window(window)
     if args.minimized and window.tray_available:
         window.hide()

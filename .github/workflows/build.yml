@@ -1,0 +1,142 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      apk: ${{ steps.version.outputs.apk }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' android/app/build.gradle.kts | head -n1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "apk=inputsharex-android-$VERSION.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK
+        shell: bash
+        working-directory: android
+        run: ./gradlew :app:assembleDebug --console=plain --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  windows:
+    name: Build Windows EXE
+    needs: android
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "cryptography>=43" "PySide6-Essentials>=6.6" "pyinstaller>=6.0" "segno>=1.5"
+
+      - name: Download Android APK
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: android-apk
+
+      - name: Bundle APK into vendor
+        shell: bash
+        run: cp android-apk/app-debug.apk vendor/inputsharex-android.apk
+
+      - name: Run Python tests
+        shell: bash
+        env:
+          PYTHONPATH: src
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python - <<'PY'
+          import runpy
+          files = (
+              "protocol", "wifi", "session", "direct", "devices", "pairing",
+              "androidapp", "keyboard", "clipboard", "qr_flow", "update",
+          )
+          total = 0
+          for name in files:
+              module = runpy.run_path("tests/test_" + name + ".py")
+              tests = [value for key, value in module.items() if key.startswith("test_") and callable(value)]
+              for test in tests:
+                  test()
+              total += len(tests)
+          print(total, "non-GUI tests passed")
+          PY
+
+      - name: Build InputShareX.exe
+        shell: powershell
+        run: |
+          Set-Location $env:GITHUB_WORKSPACE
+          .\build-desktop.ps1 -SkipIcon -OutputDirectory out
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: out/InputShareX.exe
+          if-no-files-found: error
+
+  release:
+    name: Attach assets to release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: assets
+
+      - name: Download EXE
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: assets
+
+      - name: Rename APK with version
+        shell: bash
+        run: |
+          mv assets/app-debug.apk "assets/inputsharex-android-${{ needs.android.outputs.version }}.apk"
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            assets/InputShareX.exe
+            assets/inputsharex-android-${{ needs.android.outputs.version }}.apk
+          fail_on_unmatched_files: true

@@ -4,20 +4,23 @@
 """
 from __future__ import annotations
 
+import threading
+from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtCore import QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMessageBox,
-    QDialog,
     QMenu,
+    QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QStackedWidget,
@@ -26,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__
+from .. import __repo__, __version__, update
 from ..app import CONFIG_PATH, DEFAULT_CONFIG
 from ..ui_theme import Theme, build_stylesheet, current_theme
 from . import autostart, icons
@@ -106,11 +109,17 @@ def _keycap(text: str) -> QLabel:
 
 
 class MainWindow(QMainWindow):
+    updateAvailable = Signal(object)
+    updateProgress = Signal(int, int)
+    updateFinished = Signal(str)
+    updateFailed = Signal(str)
+
     def __init__(
         self,
         controller,
         version: str | None = None,
         theme: Theme | None = None,
+        check_updates: bool = True,
     ):
         super().__init__()
         self.controller = controller
@@ -150,7 +159,17 @@ class MainWindow(QMainWindow):
         self._apply_theme(self._theme)
         self._sync_initial()
 
+        self._check_updates = check_updates
+        self._update_cancel = threading.Event()
+        self._update_dialog: QProgressDialog | None = None
+        self.updateAvailable.connect(self._on_update_available)
+        self.updateProgress.connect(self._on_update_progress)
+        self.updateFinished.connect(self._on_update_finished)
+        self.updateFailed.connect(self._on_update_failed)
+
         QTimer.singleShot(180, self._auto_discover)
+        if self._check_updates:
+            QTimer.singleShot(2500, self._check_for_updates)
 
     # ================================================================ UI
     def _build_ui(self) -> None:
@@ -453,17 +472,24 @@ class MainWindow(QMainWindow):
 
         links = Card("版本与链接")
         links.add_row("当前版本", "在命令行运行 inputsharex --version 也可查看", _keycap(f"v{self._version}"))
-        links.add_row(
-            "GitHub",
-            "仓库地址占位，发布后替换为正式链接",
-            make_label("github.com/…（占位）", "dim"),
+        repo_link = QLabel(
+            f'<a href="{__repo__}">{__repo__.replace("https://", "")}</a>'
         )
+        repo_link.setTextFormat(Qt.RichText)
+        repo_link.setOpenExternalLinks(True)
+        links.add_row("GitHub", "源码、问题反馈与最新版本", repo_link)
         links.add_row("界面技术", "PySide6 / Qt 6，跟随系统深浅色", make_label("Qt 6", "dim"))
+        links.add_row(
+            "开源许可",
+            "Unlicense（公有领域）：可自由使用、修改与商用，无需署名",
+            make_label("Unlicense", "dim"),
+        )
         layout.addWidget(links)
 
         licenses = Card("开源声明")
         text = make_label(
             "输入流转X 是独立重写的桌面端，与 InputShare2 官方无关联，也不包含其任何界面资源。\n"
+            "本项目以 Unlicense 协议开源（公有领域），可自由使用、修改与商用。\n"
             "第三方组件：scrcpy（Apache-2.0）、Android platform-tools（Google 授权）、"
             "PySide6 / Qt（LGPL-3.0）、Python（PSF）。各组件版权归原作者所有。",
             "faint",
@@ -542,6 +568,113 @@ class MainWindow(QMainWindow):
         self._update_actions()
         self._update_metrics()
         self._refresh_tray()
+
+    # ============================================================ 更新检查
+    def _check_for_updates(self) -> None:
+        """后台检查 GitHub 最新版本；失败（离线等）静默忽略。"""
+        thread = threading.Thread(
+            target=self._update_check_worker,
+            name="update-check",
+            daemon=True,
+        )
+        thread.start()
+
+    def _update_check_worker(self) -> None:
+        try:
+            info = update.check_for_update(__version__)
+        except Exception:
+            return
+        if info is not None:
+            self.updateAvailable.emit(info)
+
+    def _on_update_available(self, info) -> None:
+        notes = str(getattr(info, "notes", "") or "").strip()
+        if len(notes) > 600:
+            notes = notes[:600].rstrip() + "…"
+        box = QMessageBox(self)
+        box.setWindowTitle("发现新版本")
+        box.setIcon(QMessageBox.Information)
+        box.setText(f"发现新版本 {info.label}（当前 v{__version__}）。")
+        hint = "是否现在下载？下载完成后会提示文件位置。"
+        box.setInformativeText((notes + "\n\n" + hint) if notes else hint)
+        download_button = box.addButton("下载更新", QMessageBox.AcceptRole)
+        box.addButton("稍后", QMessageBox.RejectRole)
+        box.setDefaultButton(download_button)
+        box.exec()
+        if box.clickedButton() is download_button:
+            self._start_update_download(info)
+
+    def _start_update_download(self, info) -> None:
+        self._update_cancel.clear()
+        dialog = QProgressDialog("正在下载更新…", "取消", 0, 100, self)
+        dialog.setWindowTitle("下载更新")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.canceled.connect(self._update_cancel.set)
+        dialog.show()
+        self._update_dialog = dialog
+        threading.Thread(
+            target=self._update_download_worker,
+            args=(info,),
+            name="update-download",
+            daemon=True,
+        ).start()
+
+    def _update_download_worker(self, info) -> None:
+        try:
+            path = update.download_update(
+                info,
+                progress=lambda done, total: self.updateProgress.emit(done, total),
+                cancel=self._update_cancel.is_set,
+            )
+        except update.DownloadCancelled:
+            self.updateFailed.emit("__cancelled__")
+        except Exception as exc:  # 下载失败交给界面提示
+            self.updateFailed.emit(str(exc))
+        else:
+            self.updateFinished.emit(str(path))
+
+    def _on_update_progress(self, done: int, total: int) -> None:
+        dialog = self._update_dialog
+        if dialog is None:
+            return
+        if total > 0:
+            dialog.setMaximum(100)
+            dialog.setValue(min(100, int(done * 100 / total)))
+            dialog.setLabelText(
+                f"正在下载更新… {update.format_size(done)} / {update.format_size(total)}"
+            )
+        else:
+            dialog.setLabelText(f"正在下载更新… {update.format_size(done)}")
+
+    def _on_update_finished(self, path_text: str) -> None:
+        self._close_update_dialog()
+        path = Path(path_text)
+        box = QMessageBox(self)
+        box.setWindowTitle("更新已下载")
+        box.setIcon(QMessageBox.Information)
+        box.setText(f"新版本已下载到：\n{path}")
+        box.setInformativeText("关闭本程序后运行新的程序即可完成更新。")
+        open_button = box.addButton("打开所在文件夹", QMessageBox.ActionRole)
+        box.addButton("知道了", QMessageBox.AcceptRole)
+        box.exec()
+        if box.clickedButton() is open_button:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
+    def _on_update_failed(self, message: str) -> None:
+        self._close_update_dialog()
+        if message == "__cancelled__" or not message:
+            return
+        QMessageBox.warning(self, "下载更新失败", message)
+
+    def _close_update_dialog(self) -> None:
+        dialog = self._update_dialog
+        self._update_dialog = None
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
 
     def _update_device_header(self) -> None:
         device = self._active_device()

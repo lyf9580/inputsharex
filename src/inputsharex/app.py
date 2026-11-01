@@ -125,6 +125,8 @@ class AppController(QObject):
         self._discovered_devices = []
         self.device_link: DeviceLink | None = None
         self._armed = False
+        # 共享期间临时打开“物理键盘也显示软键盘”，结束/退出时恢复用户原设置。
+        self._ime_hard_kb_old: str | None = None
         self._stop = False
         self._sharing = False
         self._sharing_thread = None
@@ -612,8 +614,12 @@ class AppController(QObject):
                 session.set_screen_size(*self._screen_size)
             session.on_clipboard = self._on_device_clipboard
             session.create_mouse("inputsharex")
-            session.create_keyboard("inputsharex")
+            # 键盘设备不在共享开始时就创建：安卓把 UHID 键盘当成物理键盘，
+            # 会隐藏自带软键盘。推迟到真正接管鼠标时再创建。
             session.start()
+            # 共享期间允许“物理键盘 + 软键盘”并存，避免 UHID 键盘顶掉安卓自带输入法；
+            # 结束共享时（_teardown_sharing）恢复原来的系统设置。
+            self._schedule_ime_with_hard_keyboard(True)
             if not self._sharing:
                 return
             try:
@@ -701,6 +707,54 @@ class AppController(QObject):
                 pass
             self.server = None
         self._armed = False
+        self._schedule_ime_with_hard_keyboard(False)
+
+    # -- 安卓软键盘 ------------------------------------------------
+    def _apply_ime_with_hard_keyboard(self, enable: bool) -> None:
+        """共享期间让安卓在“物理键盘已连接”时仍显示自带软键盘，结束后还原。
+
+        键盘流转用 UHID 键盘，安卓会把它当成外接物理键盘；系统默认在检测到
+        物理键盘时隐藏软输入法（show_ime_with_hard_keyboard=0），表现为接管
+        后平板自带的输入法键盘不再弹出。这里只在共享期间临时打开该设置，
+        共享结束/程序退出时恢复原值，避免永久改掉用户的系统设置。
+        """
+        adb, serial = self.adb, self.serial
+        if adb is None or not serial:
+            return
+        try:
+            if enable:
+                if self._ime_hard_kb_old is None:
+                    proc = adb.run_for(
+                        serial, "shell", "settings", "get", "secure",
+                        "show_ime_with_hard_keyboard", check=False, timeout=6,
+                    )
+                    value = (proc.stdout or b"").decode("utf-8", "replace").strip()
+                    self._ime_hard_kb_old = value or "0"
+                adb.run_for(
+                    serial, "shell", "settings", "put", "secure",
+                    "show_ime_with_hard_keyboard", "1", check=False, timeout=6,
+                )
+            else:
+                old = self._ime_hard_kb_old
+                self._ime_hard_kb_old = None
+                if old is not None:
+                    adb.run_for(
+                        serial, "shell", "settings", "put", "secure",
+                        "show_ime_with_hard_keyboard", old, check=False, timeout=6,
+                    )
+        except Exception:
+            pass
+
+    def _schedule_ime_with_hard_keyboard(self, enable: bool) -> None:
+        try:
+            threading.Thread(
+                target=self._apply_ime_with_hard_keyboard,
+                args=(enable,),
+                name="ime-hard-keyboard",
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
 
     def stop_sharing(self) -> None:
         with self._sharing_lifecycle_lock:
@@ -721,9 +775,17 @@ class AppController(QObject):
         if not armed:
             self._arrow_pressed.clear()
         if not armed and self.session is not None:
-            # 切回电脑时清掉安卓端所有按键状态，避免 Ctrl/Shift 或字符卡住。
+            # 切回电脑：清掉卡住的按键，并销毁 UHID 键盘设备，
+            # 让安卓恢复自带软键盘（物理键盘设备存在时系统会隐藏软键盘）。
             try:
                 self.session.release_keys()
+                self.session.destroy_keyboard()
+            except Exception:
+                pass
+        if armed and self.session is not None:
+            # 接管时才挂上 UHID 键盘（安卓会把它当物理键盘，未接管时不该存在）。
+            try:
+                self.session.create_keyboard("inputsharex")
             except Exception:
                 pass
         self._publish_sharing_state()
@@ -1010,6 +1072,8 @@ class AppController(QObject):
         self.stop_sharing()
         if self._sharing_thread:
             self._sharing_thread.join(timeout=6)
+        # 退出前确保把 show_ime_with_hard_keyboard 还原（异步恢复线程可能来不及跑）。
+        self._apply_ime_with_hard_keyboard(False)
         if self.device_link is not None:
             self.device_link.stop()
         time.sleep(0.2)

@@ -87,6 +87,9 @@ class ControlSession:
         self._latency_samples: list[float] = []
         self._kb_mods = 0
         self._kb_keys: list[int] = []
+        # 安卓端把 UHID 键盘当成“已连接物理键盘”，设备存在时系统会隐藏软键盘。
+        # 因此键盘设备只在接管期间创建，切回电脑就销毁，避免安卓自带输入法被顶掉。
+        self._kb_created = False
         # 剪贴板同步：设备端变化回调 on_clipboard(text)，收到 SET_CLIPBOARD 的 ACK 回调
         # on_clipboard_ack(sequence)。设备端消息由独立接收线程解析。
         self.on_clipboard = None
@@ -132,13 +135,28 @@ class ControlSession:
         self.send(protocol.uhid_create(hid.HID_MOUSE_ID, name, hid.MOUSE_DESCRIPTOR))
 
     def create_keyboard(self, name: str = "inputsharex") -> None:
+        """创建 UHID 键盘设备（只在接管期间需要）。重复调用无副作用。"""
+        if self._closed or self._kb_created:
+            return
         self.send(protocol.uhid_create(hid.HID_KEYBOARD_ID, f"{name}-kbd", hid.KEYBOARD_DESCRIPTOR))
+        if not self._closed:
+            self._kb_created = True
+
+    def destroy_keyboard(self) -> None:
+        """接管结束立即销毁键盘设备，让安卓恢复自带软键盘。"""
+        if self._closed or not self._kb_created:
+            return
+        self._kb_mods = 0
+        self._kb_keys = []
+        self.send(protocol.uhid_destroy(hid.HID_KEYBOARD_ID))
+        self._kb_created = False
 
     def destroy_devices(self) -> None:
         self.send(protocol.uhid_destroy(hid.HID_MOUSE_ID))
         self.send(protocol.uhid_destroy(hid.HID_KEYBOARD_ID))
         self._kb_mods = 0
         self._kb_keys = []
+        self._kb_created = False
 
     # -- input -----------------------------------------------------
     def mouse_move(self, dx: int, dy: int, buttons: int | None = None) -> None:
@@ -208,6 +226,9 @@ class ControlSession:
         """
         if self._closed:
             return
+        if not self._kb_created:
+            # 正常流程在接管时已创建；这里兜底，避免漏创建时按键丢失。
+            self.create_keyboard()
         bit = keyboard.modifier_bit(vk, scan, extended)
         usage = None if bit else keyboard.usage_for(vk, scan, extended)
         with self._lock:
@@ -237,7 +258,7 @@ class ControlSession:
 
     def release_keys(self) -> None:
         """切回电脑/停止共享时清空所有按键，避免修饰键或字符键卡在安卓端。"""
-        if self._closed:
+        if self._closed or not self._kb_created:
             return
         with self._lock:
             if self._closed:

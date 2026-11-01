@@ -39,15 +39,18 @@ jobs:
         shell: bash
         working-directory: android
         run: |
-          # 仓库默认使用国内镜像下载 Gradle；GitHub runner 在海外，官方源更快更稳。
+          # 仓库默认使用国内镜像下载 Gradle 与 Maven 依赖；GitHub runner 在海外，官方源更快更稳。
           sed -i 's|^distributionUrl=.*|distributionUrl=https\\://services.gradle.org/distributions/gradle-8.11.1-bin.zip|' gradle/wrapper/gradle-wrapper.properties
+          sed -i '/maven\.aliyun\.com/d' settings.gradle.kts
+          grep distributionUrl gradle/wrapper/gradle-wrapper.properties
+          grep -c aliyun settings.gradle.kts || true
 
       - name: Build debug APK
         shell: bash
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --console=plain --no-daemon
+          timeout 1200 ./gradlew :app:assembleDebug --console=plain --no-daemon --stacktrace
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4

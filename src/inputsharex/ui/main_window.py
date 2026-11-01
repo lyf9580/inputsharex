@@ -509,6 +509,10 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentIndex(index)
             self.nav.set_current(index)
 
+    def _link_connected(self) -> bool:
+        """辅助通道是否已连接：只有这种情况下才把设备卡片标成“已连接”。"""
+        return self._state in ("connected", "starting", "sharing")
+
     def _active_device(self) -> dict | None:
         serial = self._connected_serial
         if not serial:
@@ -556,13 +560,19 @@ class MainWindow(QMainWindow):
                 widget.deleteLater()
         self._device_cards = []
         serial = self._connected_serial
+        profile = str(getattr(self.controller, "_active_profile", "") or "")
+        link_ready = self._link_connected()
         for kind, _label in TRANSPORTS.items():
             if kind != list(TRANSPORTS)[self.transport_tabs.currentIndex()]:
                 continue
             group = [d for d in self._devices if d.get("transport") == kind]
             for device in group:
+                if profile:
+                    active = link_ready and device.get("id") == profile
+                else:
+                    active = link_ready and bool(serial) and device.get("serial") == serial
                 card = DeviceCard(self._theme)
-                card.set_device(device, active=device.get("id") == getattr(self.controller, "_active_profile", ""))
+                card.set_device(device, active=active)
                 card.clicked.connect(self._on_device_clicked)
                 card.editRequested.connect(self._edit_device)
                 card.deleteRequested.connect(self._delete_device)

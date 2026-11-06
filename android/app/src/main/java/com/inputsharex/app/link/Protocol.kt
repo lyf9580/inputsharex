@@ -3,7 +3,7 @@ package com.inputsharex.app.link
 import org.json.JSONObject
 
 /** Protocol constants, see docs/LINK_PROTOCOL.md in the desktop repository. */
-const val APP_VERSION = "0.3.0"
+const val APP_VERSION = "0.3.1"
 const val PROTOCOL_VERSION = 1
 const val LINK_HOST = "127.0.0.1"
 const val LINK_PORT = 27184

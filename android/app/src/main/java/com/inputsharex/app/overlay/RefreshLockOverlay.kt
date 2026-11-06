@@ -101,9 +101,11 @@ object RefreshLockOverlay {
     fun defaultConfig(context: Context): RefreshConfig = RefreshConfig(
         frameRate = 120f,
         preferredModeId = -1,
-        // 实测：在这台平板上只投票(不产帧)不足以把面板钉住，需要持续投帧；
-        // 按目标刷新率投帧，避免后台覆盖层以 500fps 持续唤醒。
-        drawLoop = true,
+        // 2026-11-06 实测（Xiaomi Pad 7 Pro / MIUI）：只要有一个有效的 Surface 调用
+        // Surface.setFrameRate(120, CHANGED_ALWAYS)，面板空闲时也会保持 120Hz，
+        // SurfaceFlinger 约 1–2% CPU；而每帧 lockCanvas 投帧会让整屏走 GPU 合成，
+        // SurfaceFlinger 升到 60%，整机反而卡顿。因此默认只投票、不产帧。
+        drawLoop = false,
     )
 
     fun show(context: Context, config: RefreshConfig): Boolean {
@@ -208,6 +210,9 @@ object RefreshLockOverlay {
         val thread = Thread({
             val holder = view.holder
             var lastApply = 0L
+            // 不投帧时也先画一帧，确保 Surface 有有效 buffer（部分设备上无 buffer 的
+            // 图层不会参与帧率投票）。
+            var pendingFirstFrame = !config.drawLoop
             val frameInterval = (1000f / config.frameRate.coerceIn(1f, 144f)).toLong().coerceAtLeast(1L)
             while (running.get()) {
                 val surface = runCatching { holder.surface }.getOrNull()
@@ -220,7 +225,8 @@ object RefreshLockOverlay {
                     applyFrameRate(surface, config)
                     lastApply = now
                 }
-                if (config.drawLoop) {
+                if (config.drawLoop || pendingFirstFrame) {
+                    pendingFirstFrame = false
                     var canvas: Canvas? = null
                     try {
                         canvas = holder.lockCanvas()

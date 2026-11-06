@@ -29,6 +29,8 @@ class PointerMonitor:
         self.desired = "0\n"
         self.available = False
         self.diagnostic = []
+        self.position = None
+        self.position_at = 0.0
 
     def start(self):
         remote = "/data/local/tmp/inputsharex-pointer.jar"
@@ -52,6 +54,12 @@ class PointerMonitor:
                     self.available = True
                     _dbg(f"READY pid={self.pid}")
                     self._write()
+                elif len(parts) == 7 and parts[0] == "POSITION":
+                    import time as _time
+                    self.position = (float(parts[3]), float(parts[4]),
+                                     float(parts[5]), float(parts[6]))
+                    self.position_at = _time.monotonic()
+                    _dbg('POSITION ' + ' '.join(parts[1:]))
                 elif len(parts) == 7 and parts[0] == "EDGE":
                     _dbg("EDGE " + " ".join(parts[1:]))
                     self.on_edge({"generation": int(parts[1]), "placement": int(parts[2]),
@@ -63,6 +71,7 @@ class PointerMonitor:
             pass
         finally:
             self.available = False
+            self.position = None
             if self.on_error:
                 self.on_error()
 
@@ -74,6 +83,15 @@ class PointerMonitor:
                     self.proc.stdin.flush()
                 except (OSError, ValueError):
                     pass
+
+    def latest_position(self, max_age: float = 1.0):
+        pos = self.position
+        if pos is None:
+            return None
+        import time as _time
+        if _time.monotonic() - self.position_at > max_age:
+            return None
+        return pos
 
     def set_enabled(self, enabled, generation, placement):
         self.desired = f"1 {int(generation)} {int(placement)}\n" if enabled else "0\n"

@@ -308,6 +308,31 @@ def _primary_monitor_rect() -> tuple[int, int, int, int]:
     return _monitor_rect_from_handle(hmon)
 
 
+def edge_fraction(edge: int, pos: tuple[int, int]) -> float:
+    """进入边缘时，光标沿共享边的相对位置（0..1）。"""
+    left, top, right, bottom = _monitor_rect(pos[0], pos[1])
+    if edge in (EDGE_RIGHT, EDGE_LEFT):
+        span = bottom - top - 1
+        value = (pos[1] - top) / span if span > 0 else 0.0
+    else:
+        span = right - left - 1
+        value = (pos[0] - left) / span if span > 0 else 0.0
+    return max(0.0, min(1.0, float(value)))
+
+
+def entry_target(edge: int, fraction: float, max_x: float, max_y: float,
+                 inset: float = 8.0) -> tuple[float, float]:
+    """共享边内侧的等比目标点（安卓端逻辑坐标）。"""
+    f = max(0.0, min(1.0, float(fraction)))
+    if edge == EDGE_RIGHT:
+        return (inset, f * max_y)
+    if edge == EDGE_LEFT:
+        return (max_x - inset, f * max_y)
+    if edge == EDGE_BOTTOM:
+        return (f * max_x, inset)
+    return (f * max_x, max_y - inset)
+
+
 class InputCapture:
     """后台消息窗口线程：捕获鼠标原始位移/按键，按需转发给安卓端。
 
@@ -316,7 +341,7 @@ class InputCapture:
     """
 
     def __init__(self, on_move=None, on_button=None, on_wheel=None, on_toggle=None,
-                 on_edge=None, on_key=None, on_clipboard=None,
+                 on_edge=None, on_enter=None, on_key=None, on_clipboard=None,
                  hotkey_mods: int = MOD_CONTROL | MOD_ALT, hotkey_vk: int = VK_Q,
                  edge_switch: bool = True, edge: int = EDGE_RIGHT, edge_zone: int = 6,
                  return_px: int = 96, allow_extended_edge: bool = False):
@@ -324,7 +349,9 @@ class InputCapture:
         self.on_button = on_button or (lambda buttons: None)
         self.on_wheel = on_wheel or (lambda v, h: None)
         self.on_toggle = on_toggle or (lambda armed: None)
+        self.user_move_seq = 0
         self.on_edge = on_edge or (lambda edge, entered: None)
+        self.on_enter = on_enter or (lambda edge, fraction: None)
         self.on_key = on_key or (lambda vk, scan, extended, up: None)
         self.on_clipboard = on_clipboard or (lambda text: None)
         self.can_capture = lambda: True
@@ -549,6 +576,8 @@ class InputCapture:
             self.buttons &= ~BTN_EXTRA
 
         dx, dy = raw.mouse.lLastX, raw.mouse.lLastY
+        if dx or dy:
+            self.user_move_seq += 1
 
         if not self.armed:
             if self.edge_switch and (dx or dy):
@@ -678,6 +707,10 @@ class InputCapture:
         user32.SetCursor(None)
         self.armed = True
         self._kb_mods = 0
+        if edge_mode:
+            self.on_enter(self.edge, edge_fraction(self.edge, (x, y)))
+        else:
+            self.on_enter(self.edge, None)
         self.on_toggle(True)
         if edge_mode:
             self.on_edge(self.edge, True)

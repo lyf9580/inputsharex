@@ -40,6 +40,7 @@ public final class InputShareXPointerProbe {
         System.out.flush();
         String previous = "";
         boolean interiorSeen = false, sent = false, positionReported = false;
+        float lastX = Float.NaN, lastY = Float.NaN;
         while (running) {
             String current = command;
             if (!current.equals(previous)) {
@@ -47,6 +48,8 @@ public final class InputShareXPointerProbe {
                 interiorSeen = false;
                 sent = false;
                 positionReported = false;
+                lastX = Float.NaN;
+                lastY = Float.NaN;
             }
             if (current.startsWith("1 ") && !sent) {
                 String[] parts = current.split(" ");
@@ -68,9 +71,14 @@ public final class InputShareXPointerProbe {
                             if (point != null && current.equals(command)) {
                                 float[] logical = logicalPoint(dump, point[0], point[1], rx.getMax(), ry.getMax());
                                 float x = logical[0], y = logical[1], maxX = logical[2], maxY = logical[3];
-                                if (!positionReported) {
+                                boolean changed = !positionReported
+                                    || Float.isNaN(lastX) || Math.abs(x - lastX) > 0.5f
+                                    || Float.isNaN(lastY) || Math.abs(y - lastY) > 0.5f;
+                                if (changed) {
                                     System.out.println("POSITION " + parts[1] + " " + mouse.getId() + " " + x + " " + y + " " + maxX + " " + maxY);
                                     System.out.flush();
+                                    lastX = x;
+                                    lastY = y;
                                     positionReported = true;
                                 }
                                 boolean boundary = edge == 0 ? x <= 0.5f : edge == 1 ? x >= maxX - 0.5f

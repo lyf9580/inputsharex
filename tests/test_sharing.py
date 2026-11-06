@@ -376,3 +376,66 @@ def test_extended_edge_setting_defaults_off_and_updates_capture():
         value.update_config(edge_on_extended=True)
     save.assert_called_once()
     value.capture.set_allow_extended_edge.assert_called_once_with(True)
+
+
+def test_edge_fraction_uses_primary_axis():
+    from inputsharex import capture as capture_module
+
+    rect = (0, 0, 2560, 1600)
+    with patch.object(capture_module, "_monitor_rect", return_value=rect):
+        assert abs(capture_module.edge_fraction(capture_module.EDGE_RIGHT, (2559, 800))
+                   - 800 / 1599) < 1e-6
+        assert capture_module.edge_fraction(capture_module.EDGE_RIGHT, (2559, -10)) == 0.0
+        assert capture_module.edge_fraction(capture_module.EDGE_RIGHT, (2559, 9999)) == 1.0
+        assert abs(capture_module.edge_fraction(capture_module.EDGE_BOTTOM, (1280, 1599))
+                   - 1280 / 2559) < 1e-6
+
+
+def test_entry_target_maps_fraction_to_android_edge():
+    from inputsharex import capture as capture_module
+
+    max_x, max_y = 3199.0, 2135.0
+    assert capture_module.entry_target(capture_module.EDGE_RIGHT, 0.0, max_x, max_y) == (8.0, 0.0)
+    assert capture_module.entry_target(capture_module.EDGE_RIGHT, 1.0, max_x, max_y) == (8.0, 2135.0)
+    tx, ty = capture_module.entry_target(capture_module.EDGE_LEFT, 0.5, max_x, max_y)
+    assert abs(tx - (max_x - 8.0)) < 1e-9 and abs(ty - 1067.5) < 1e-9
+    tx, ty = capture_module.entry_target(capture_module.EDGE_BOTTOM, 1.0, max_x, max_y)
+    assert abs(tx - 3199.0) < 1e-9 and abs(ty - 8.0) < 1e-9
+    tx, ty = capture_module.entry_target(capture_module.EDGE_TOP, 0.0, max_x, max_y)
+    assert abs(tx - 0.0) < 1e-9 and abs(ty - (max_y - 8.0)) < 1e-9
+
+
+def test_enter_reports_fraction_for_edge_and_clears_for_hotkey():
+    from inputsharex import capture as capture_module
+
+    rect = (0, 0, 2560, 1600)
+    reported = []
+    capture = capture_module.InputCapture(on_enter=lambda edge, fraction: reported.append((edge, fraction)))
+    capture.can_capture = lambda: True
+    with patch.object(capture_module, "_monitor_rect", return_value=rect), \
+            patch.object(capture_module, "user32"):
+        capture._enter(2559, 400, True)
+    assert len(reported) == 1
+    edge, fraction = reported[0]
+    assert edge == capture_module.EDGE_RIGHT and abs(fraction - 400 / 1599) < 1e-6
+
+    hotkey = capture_module.InputCapture(on_enter=lambda edge, fraction: reported.append((edge, fraction)))
+    hotkey.can_capture = lambda: True
+    with patch.object(capture_module, "user32"):
+        hotkey._enter(100, 100, False)
+    assert reported[-1] == (capture_module.EDGE_RIGHT, None)
+
+
+def test_on_edge_enter_clamps_fraction():
+    from inputsharex.app import AppController
+
+    class Dummy:
+        _enter_fraction = None
+
+    dummy = Dummy()
+    AppController._on_edge_enter(dummy, 0, 1.7)
+    assert dummy._enter_fraction == 1.0
+    AppController._on_edge_enter(dummy, 0, -0.2)
+    assert dummy._enter_fraction == 0.0
+    AppController._on_edge_enter(dummy, 0, None)
+    assert dummy._enter_fraction is None

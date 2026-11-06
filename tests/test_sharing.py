@@ -7,7 +7,15 @@ from unittest.mock import Mock, patch
 from PySide6.QtCore import QCoreApplication
 
 from inputsharex.app import AppController, DEFAULT_CONFIG
-from inputsharex.capture import InputCapture
+from inputsharex.capture import (
+    EDGE_BOTTOM,
+    EDGE_LEFT,
+    EDGE_RIGHT,
+    EDGE_TOP,
+    InputCapture,
+    edge_fraction,
+    entry_target,
+)
 from inputsharex.link import DeviceLink
 
 APP = QCoreApplication.instance() or QCoreApplication([])
@@ -123,6 +131,50 @@ def test_edge_return_point_without_fraction_keeps_old_behaviour():
     rect=(0,0,2560,1600)
     assert InputCapture._edge_return_point(0,None,rect,(2559,700))==(2512,700)
     assert InputCapture._edge_return_point(2,None,rect,(900,1599))==(900,1552)
+
+def test_edge_fraction_uses_primary_axis():
+    from inputsharex import capture as capture_module
+
+    rect = (0, 0, 2560, 1600)
+    with patch.object(capture_module, "_monitor_rect", return_value=rect):
+        assert abs(edge_fraction(capture_module.EDGE_RIGHT, (2559, 800)) - 800 / 1599) < 1e-6
+        assert edge_fraction(capture_module.EDGE_RIGHT, (2559, -10)) == 0.0
+        assert edge_fraction(capture_module.EDGE_RIGHT, (2559, 5000)) == 1.0
+        assert abs(edge_fraction(capture_module.EDGE_BOTTOM, (1280, 1599)) - 1280 / 2559) < 1e-6
+
+
+def test_entry_target_maps_fraction_to_android_edge():
+    assert entry_target(EDGE_RIGHT, 0.0, 3199, 2135) == (8.0, 0.0)
+    assert entry_target(EDGE_RIGHT, 1.0, 3199, 2135) == (8.0, 2135.0)
+    x, y = entry_target(EDGE_LEFT, 0.5, 3199, 2135)
+    assert x == 3199 - 8.0 and abs(y - 1067.5) < 1e-6
+    x, y = entry_target(EDGE_BOTTOM, 1.0, 3199, 2135)
+    assert x == 3199.0 and y == 8.0
+    x, y = entry_target(EDGE_TOP, 0.0, 3199, 2135)
+    assert x == 0.0 and y == 2135 - 8.0
+
+
+def test_enter_reports_fraction_for_edge_and_clears_for_hotkey():
+    from inputsharex import capture as capture_module
+
+    seen = []
+    capture = InputCapture(edge=capture_module.EDGE_RIGHT,
+                           on_enter=lambda edge, fraction: seen.append((edge, fraction)))
+    capture.can_capture = lambda: True
+    with patch.object(capture_module, "_monitor_rect", return_value=(0, 0, 2560, 1600)), \
+            patch.object(capture_module, "user32"):
+        capture._enter(2559, 400, True)
+    assert capture.armed
+    assert seen and seen[0][0] == capture_module.EDGE_RIGHT
+    assert abs(seen[0][1] - 400 / 1599) < 1e-6
+
+    manual = InputCapture(edge=capture_module.EDGE_RIGHT,
+                          on_enter=lambda edge, fraction: seen.append((edge, fraction)))
+    manual.can_capture = lambda: True
+    with patch.object(capture_module, "user32"):
+        manual._enter(100, 100, False)
+    assert seen[-1][1] is None
+
 
 
 def test_manual_profiles_survive_edit_and_deletion_does_not_reappear():

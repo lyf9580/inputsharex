@@ -29,6 +29,8 @@ class PointerMonitor:
         self.desired = "0\n"
         self.available = False
         self.diagnostic = []
+        self.position = None
+        self.position_at = 0.0
 
     def start(self):
         remote = "/data/local/tmp/inputsharex-pointer.jar"
@@ -52,6 +54,11 @@ class PointerMonitor:
                     self.available = True
                     _dbg(f"READY pid={self.pid}")
                     self._write()
+                elif len(parts) == 7 and parts[0] == "POSITION":
+                    self.position = (float(parts[3]), float(parts[4]),
+                                     float(parts[5]), float(parts[6]))
+                    self.position_at = time.monotonic()
+                    _dbg(f"POSITION {parts[3]} {parts[4]} {parts[5]} {parts[6]}")
                 elif len(parts) == 7 and parts[0] == "EDGE":
                     _dbg("EDGE " + " ".join(parts[1:]))
                     self.on_edge({"generation": int(parts[1]), "placement": int(parts[2]),
@@ -63,6 +70,7 @@ class PointerMonitor:
             pass
         finally:
             self.available = False
+            self.position = None
             if self.on_error:
                 self.on_error()
 
@@ -71,6 +79,26 @@ class PointerMonitor:
             if self.proc and self.proc.poll() is None and self.available:
                 try:
                     self.proc.stdin.write(self.desired.encode())
+                    self.proc.stdin.flush()
+                except (OSError, ValueError):
+                    pass
+
+    def latest_position(self, max_age=1.0):
+        with self.lock:
+            pos = self.position
+            at = self.position_at
+        if pos is None or (time.monotonic() - at) > max_age:
+            return None
+        return pos
+
+    def suppress_edges(self, duration_ms: int) -> None:
+        """临时压制 EDGE 事件（继续上报 POSITION），用于进入后的光标对齐。"""
+        if not self.available:
+            return
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                try:
+                    self.proc.stdin.write(f"s {int(duration_ms)}\n".encode())
                     self.proc.stdin.flush()
                 except (OSError, ValueError):
                     pass

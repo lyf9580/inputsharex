@@ -21,7 +21,7 @@ from .androidapp import (
     ensure_installed as ensure_android_app_installed,
     launch as launch_android_app,
 )
-from .capture import InputCapture, MOD_ALT, MOD_CONTROL, VK_Q, _dbg as _dbg_edge
+from .capture import InputCapture, MOD_ALT, MOD_CONTROL, VK_Q, _dbg as _dbg_edge, entry_target
 from .link import DeviceLink
 from .pairing import (
     DEFAULT_WATCH_TIMEOUT,
@@ -122,6 +122,7 @@ class AppController(QObject):
         self.session: ControlSession | None = None
         self.capture: InputCapture | None = None
         self.pointer_monitor = None
+        self._enter_fraction: float | None = None
         self._discovered_devices = []
         self.device_link: DeviceLink | None = None
         self._armed = False
@@ -651,6 +652,7 @@ class AppController(QObject):
                 on_clipboard=self._on_windows_clipboard,
                 on_toggle=self._on_arm_toggle,
                 on_edge=self._on_edge,
+                on_enter=self._on_edge_enter,
                 hotkey_mods=mods,
                 hotkey_vk=vk,
                 edge_switch=bool(self.config.get("edge_switch", True)),
@@ -796,6 +798,11 @@ class AppController(QObject):
                 self.session.create_keyboard("inputsharex")
             except Exception:
                 pass
+        if armed and self.session is not None and self._enter_fraction is not None:
+            fraction = self._enter_fraction
+            self._enter_fraction = None
+            threading.Thread(target=self._align_pointer_to_shared_edge,
+                             args=(fraction,), name="align-pointer", daemon=True).start()
         self._publish_sharing_state()
         if armed:
             self._log("鼠标已切换到安卓端（移动回原侧边缘可切回）")
@@ -890,6 +897,62 @@ class AppController(QObject):
         names = {0: "右", 1: "左", 2: "下", 3: "上"}
         side = names.get(int(edge), str(edge))
         self._log(f"边缘切换：{side}侧 → 安卓端" if entered else f"边缘切换：{side}侧 → 电脑")
+
+    def _on_edge_enter(self, edge: int, fraction) -> None:
+        self._enter_fraction = None if fraction is None else max(0.0, min(1.0, float(fraction)))
+
+    def _align_pointer_to_shared_edge(self, fraction: float) -> None:
+        """进入安卓端后，把安卓端光标放到共享边内侧的等比位置。
+
+        对齐期间让探针暂时不报 EDGE（仍持续上报 POSITION），避免中途误触发返回。
+        """
+        edge = getattr(self.capture, "edge", None)
+        monitor = self.pointer_monitor
+        if edge is None or monitor is None:
+            return
+
+        try:
+            monitor.suppress_edges(6000)
+        except Exception:
+            pass
+
+        gain = 1.0
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not self._armed or self.session is None or self.session.closed:
+                return
+            pos = monitor.latest_position(0.5)
+            if pos is None:
+                time.sleep(0.03)
+                continue
+            x, y, max_x, max_y = pos
+            tx, ty = entry_target(edge, fraction, max_x, max_y)
+            dx, dy = tx - x, ty - y
+            if abs(dx) <= 6 and abs(dy) <= 6:
+                return
+            # 按实测的移动增益换算请求：安卓端对 UHID 相对移动有加速，1 格≠1 像素。
+            req_x = int(max(-40, min(40, round(dx / gain))))
+            req_y = int(max(-40, min(40, round(dy / gain))))
+            if req_x == 0 and dx != 0:
+                req_x = 1 if dx > 0 else -1
+            if req_y == 0 and dy != 0:
+                req_y = 1 if dy > 0 else -1
+            try:
+                self.session.mouse_move(req_x, req_y)
+            except Exception:
+                return
+            time.sleep(0.1)
+            moved = monitor.latest_position(0.6)
+            if moved is not None:
+                ax = abs(moved[0] - x)
+                ay = abs(moved[1] - y)
+                ratio = None
+                if abs(dx) >= abs(dy) and req_x:
+                    ratio = ax / abs(req_x)
+                elif req_y:
+                    ratio = ay / abs(req_y)
+                if ratio is not None and ratio > 0.05:
+                    gain = max(0.3, min(4.0, 0.6 * gain + 0.4 * ratio))
 
     def toggle_armed(self) -> None:
         if self.capture is None:

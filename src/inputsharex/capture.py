@@ -308,41 +308,15 @@ def _primary_monitor_rect() -> tuple[int, int, int, int]:
     return _monitor_rect_from_handle(hmon)
 
 
-def edge_fraction(edge: int, pos: tuple[int, int]) -> float:
-    """PC 侧进入位置在共享边上的比例：横向边缘取纵向比例，纵向边缘取横向比例。"""
-    x, y = pos
-    left, top, right, bottom = _monitor_rect(x, y)
-    if edge in (EDGE_LEFT, EDGE_RIGHT):
-        span = max(bottom - top - 1, 1)
-        frac = (y - top) / span
-    else:
-        span = max(right - left - 1, 1)
-        frac = (x - left) / span
-    return min(max(frac, 0.0), 1.0)
-
-
-def entry_target(edge: int, fraction: float, max_x: float, max_y: float) -> tuple[float, float]:
-    """安卓端进入落点：落在共享边内侧 8px，另一轴按 PC 侧的比例换算。"""
-    f = min(max(float(fraction), 0.0), 1.0)
-    inset = 8.0
-    if edge == EDGE_RIGHT:      # PC 右缘 -> 安卓左缘
-        return inset, f * max_y
-    if edge == EDGE_LEFT:       # PC 左缘 -> 安卓右缘
-        return max_x - inset, f * max_y
-    if edge == EDGE_BOTTOM:     # PC 下缘 -> 安卓上缘
-        return f * max_x, inset
-    return f * max_x, max_y - inset  # PC 上缘 -> 安卓下缘
-
-
 class InputCapture:
     """后台消息窗口线程：捕获鼠标原始位移/按键，按需转发给安卓端。
 
     回调：on_move(dx, dy, buttons) / on_button(buttons) / on_wheel(v, h) /
-          on_toggle(armed) / on_edge(edge, entered) / on_enter(edge, fraction)
+          on_toggle(armed) / on_edge(edge, entered)
     """
 
     def __init__(self, on_move=None, on_button=None, on_wheel=None, on_toggle=None,
-                 on_edge=None, on_enter=None, on_key=None, on_clipboard=None,
+                 on_edge=None, on_key=None, on_clipboard=None,
                  hotkey_mods: int = MOD_CONTROL | MOD_ALT, hotkey_vk: int = VK_Q,
                  edge_switch: bool = True, edge: int = EDGE_RIGHT, edge_zone: int = 6,
                  return_px: int = 96, allow_extended_edge: bool = False):
@@ -351,7 +325,6 @@ class InputCapture:
         self.on_wheel = on_wheel or (lambda v, h: None)
         self.on_toggle = on_toggle or (lambda armed: None)
         self.on_edge = on_edge or (lambda edge, entered: None)
-        self.on_enter = on_enter or (lambda edge, fraction: None)
         self.on_key = on_key or (lambda vk, scan, extended, up: None)
         self.on_clipboard = on_clipboard or (lambda text: None)
         self.can_capture = lambda: True
@@ -705,10 +678,6 @@ class InputCapture:
         user32.SetCursor(None)
         self.armed = True
         self._kb_mods = 0
-        if edge_mode:
-            self.on_enter(self.edge, edge_fraction(self.edge, (x, y)))
-        else:
-            self.on_enter(self.edge, None)
         self.on_toggle(True)
         if edge_mode:
             self.on_edge(self.edge, True)

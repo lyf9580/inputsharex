@@ -21,7 +21,7 @@ from .androidapp import (
     ensure_installed as ensure_android_app_installed,
     launch as launch_android_app,
 )
-from .capture import InputCapture, MOD_ALT, MOD_CONTROL, VK_Q, _dbg as _dbg_edge, entry_target
+from .capture import InputCapture, MOD_ALT, MOD_CONTROL, VK_Q, _dbg as _dbg_edge
 from .link import DeviceLink
 from .pairing import (
     DEFAULT_WATCH_TIMEOUT,
@@ -122,7 +122,6 @@ class AppController(QObject):
         self.session: ControlSession | None = None
         self.capture: InputCapture | None = None
         self.pointer_monitor = None
-        self._enter_fraction: float | None = None
         self._discovered_devices = []
         self.device_link: DeviceLink | None = None
         self._armed = False
@@ -652,7 +651,6 @@ class AppController(QObject):
                 on_clipboard=self._on_windows_clipboard,
                 on_toggle=self._on_arm_toggle,
                 on_edge=self._on_edge,
-                on_enter=self._on_edge_enter,
                 hotkey_mods=mods,
                 hotkey_vk=vk,
                 edge_switch=bool(self.config.get("edge_switch", True)),
@@ -798,11 +796,6 @@ class AppController(QObject):
                 self.session.create_keyboard("inputsharex")
             except Exception:
                 pass
-        if armed and self.session is not None and self._enter_fraction is not None:
-            fraction = self._enter_fraction
-            self._enter_fraction = None
-            threading.Thread(target=self._align_pointer_to_shared_edge,
-                             args=(fraction,), name="align-pointer", daemon=True).start()
         self._publish_sharing_state()
         if armed:
             self._log("鼠标已切换到安卓端（移动回原侧边缘可切回）")
@@ -897,78 +890,6 @@ class AppController(QObject):
         names = {0: "右", 1: "左", 2: "下", 3: "上"}
         side = names.get(int(edge), str(edge))
         self._log(f"边缘切换：{side}侧 → 安卓端" if entered else f"边缘切换：{side}侧 → 电脑")
-
-    def _on_edge_enter(self, edge: int, fraction) -> None:
-        self._enter_fraction = None if fraction is None else max(0.0, min(1.0, float(fraction)))
-
-    def _align_pointer_to_shared_edge(self, fraction: float) -> None:
-        """进入安卓端后，把安卓端光标放到共享边内侧的等比位置。
-
-        对齐期间让探针暂时不报 EDGE（仍持续上报 POSITION），避免中途误触发返回。
-        """
-        edge = getattr(self.capture, "edge", None)
-        monitor = self.pointer_monitor
-        if edge is None or monitor is None:
-            return
-
-        # 只沿共享边方向对齐（不改变垂直于边缘的深度）：
-        # 深度方向的相对移动一旦过冲就会撞到边界，触发误返回/抖动；
-        # 平行方向移动永远不会引起共享边 EDGE，因此对齐期间无需抑制边缘事件。
-        if edge in (0, 1):
-            axis = "y"
-        else:
-            axis = "x"
-
-        time.sleep(0.2)  # 等进入瞬间的惯性移动发完，避免校准被残余位移带偏
-        try:
-            gain = 1.0
-            deadline = time.monotonic() + 2.0
-            steps = 0
-            while time.monotonic() < deadline:
-                if not self._armed or self.session is None or self.session.closed:
-                    return
-                pos = monitor.latest_position(0.5)
-                if pos is None:
-                    time.sleep(0.03)
-                    continue
-                x, y, max_x, max_y = pos
-                tx, ty = entry_target(edge, fraction, max_x, max_y)
-                if axis == "y":
-                    delta = ty - y
-                    req_x, req_y = 0, None
-                else:
-                    delta = tx - x
-                    req_x, req_y = None, 0
-                if abs(delta) <= 8:
-                    return
-                steps += 1
-                limit = 6 if steps <= 2 else 40
-                req = int(max(-limit, min(limit, round(delta / gain))))
-                if req == 0:
-                    req = 1 if delta > 0 else -1
-                if axis == "y":
-                    req_y = req
-                else:
-                    req_x = req
-                try:
-                    self.session.mouse_move(req_x or 0, req_y or 0)
-                except Exception:
-                    return
-                time.sleep(0.05)
-                moved = monitor.latest_position(0.5)
-                if moved is not None:
-                    step = (moved[1] - y) if axis == "y" else (moved[0] - x)
-                    if req and step * req < -2:
-                        return
-                    ratio = abs(step) / abs(req) if req else 0
-                    if ratio > 0.05:
-                        gain = max(0.3, min(8.0, 0.6 * gain + 0.4 * ratio))
-        finally:
-            # 无论对齐是否完成/中止，都立即恢复边缘检测，避免挡住用户回推。
-            try:
-                monitor.suppress_edges(0)
-            except Exception:
-                pass
 
     def toggle_armed(self) -> None:
         if self.capture is None:

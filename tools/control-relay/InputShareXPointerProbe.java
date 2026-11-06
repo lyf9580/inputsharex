@@ -12,7 +12,6 @@ import java.util.regex.*;
 public final class InputShareXPointerProbe {
     private static volatile boolean running = true;
     private static volatile String command = "0";
-    private static volatile long suppressEdgeUntilMs = 0L;
     private static final Pattern DEVICE_STATE = Pattern.compile("(?:DeviceId\\()?(\\d+)\\)?:\\[");
     private static final Pattern POINT = Pattern.compile("hoveringPointers=\\[Pointer\\(id=\\d+, MOUSE\\) at \\(([-0-9.]+), ([-0-9.]+)\\)");
     // InputDispatcher 里的鼠标坐标是“未旋转的物理/自然坐标”，而窗口/显示已经按 ROTATION_* 旋转；
@@ -30,17 +29,7 @@ public final class InputShareXPointerProbe {
         Thread control = new Thread(() -> {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.US_ASCII))) {
                 String line;
-                while ((line = reader.readLine()) != null) {
-                    String trimmed = line.trim();
-                    if (trimmed.startsWith("s ")) {
-                        try {
-                            suppressEdgeUntilMs = System.currentTimeMillis()
-                                + Long.parseLong(trimmed.substring(2).trim());
-                        } catch (NumberFormatException ignored) { }
-                    } else {
-                        command = trimmed;
-                    }
-                }
+                while ((line = reader.readLine()) != null) command = line.trim();
             } catch (IOException ignored) { }
             finally { running = false; Process.killProcess(Process.myPid()); }
         }, "pointer-control");
@@ -51,7 +40,6 @@ public final class InputShareXPointerProbe {
         System.out.flush();
         String previous = "";
         boolean interiorSeen = false, sent = false, positionReported = false;
-        float lastX = Float.NaN, lastY = Float.NaN;
         while (running) {
             String current = command;
             if (!current.equals(previous)) {
@@ -59,8 +47,6 @@ public final class InputShareXPointerProbe {
                 interiorSeen = false;
                 sent = false;
                 positionReported = false;
-                lastX = Float.NaN;
-                lastY = Float.NaN;
             }
             if (current.startsWith("1 ") && !sent) {
                 String[] parts = current.split(" ");
@@ -82,19 +68,15 @@ public final class InputShareXPointerProbe {
                             if (point != null && current.equals(command)) {
                                 float[] logical = logicalPoint(dump, point[0], point[1], rx.getMax(), ry.getMax());
                                 float x = logical[0], y = logical[1], maxX = logical[2], maxY = logical[3];
-                                if (!positionReported
-                                        || Math.abs(x - lastX) > 0.5f || Math.abs(y - lastY) > 0.5f) {
+                                if (!positionReported) {
                                     System.out.println("POSITION " + parts[1] + " " + mouse.getId() + " " + x + " " + y + " " + maxX + " " + maxY);
                                     System.out.flush();
                                     positionReported = true;
-                                    lastX = x;
-                                    lastY = y;
                                 }
                                 boolean boundary = edge == 0 ? x <= 0.5f : edge == 1 ? x >= maxX - 0.5f
                                     : edge == 2 ? y <= 0.5f : y >= maxY - 0.5f;
                                 if (!boundary) interiorSeen = true;
-                                if (boundary && interiorSeen
-                                        && System.currentTimeMillis() >= suppressEdgeUntilMs) {
+                                if (boundary && interiorSeen) {
                                     System.out.println("EDGE " + parts[1] + " " + edge + " " + x + " " + y + " " + maxX + " " + maxY);
                                     System.out.flush();
                                     sent = true;

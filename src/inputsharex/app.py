@@ -911,48 +911,64 @@ class AppController(QObject):
         if edge is None or monitor is None:
             return
 
-        try:
-            monitor.suppress_edges(6000)
-        except Exception:
-            pass
+        # 只沿共享边方向对齐（不改变垂直于边缘的深度）：
+        # 深度方向的相对移动一旦过冲就会撞到边界，触发误返回/抖动；
+        # 平行方向移动永远不会引起共享边 EDGE，因此对齐期间无需抑制边缘事件。
+        if edge in (0, 1):
+            axis = "y"
+        else:
+            axis = "x"
 
-        gain = 1.0
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if not self._armed or self.session is None or self.session.closed:
-                return
-            pos = monitor.latest_position(0.5)
-            if pos is None:
-                time.sleep(0.03)
-                continue
-            x, y, max_x, max_y = pos
-            tx, ty = entry_target(edge, fraction, max_x, max_y)
-            dx, dy = tx - x, ty - y
-            if abs(dx) <= 6 and abs(dy) <= 6:
-                return
-            # 按实测的移动增益换算请求：安卓端对 UHID 相对移动有加速，1 格≠1 像素。
-            req_x = int(max(-40, min(40, round(dx / gain))))
-            req_y = int(max(-40, min(40, round(dy / gain))))
-            if req_x == 0 and dx != 0:
-                req_x = 1 if dx > 0 else -1
-            if req_y == 0 and dy != 0:
-                req_y = 1 if dy > 0 else -1
+        time.sleep(0.2)  # 等进入瞬间的惯性移动发完，避免校准被残余位移带偏
+        try:
+            gain = 1.0
+            deadline = time.monotonic() + 2.0
+            steps = 0
+            while time.monotonic() < deadline:
+                if not self._armed or self.session is None or self.session.closed:
+                    return
+                pos = monitor.latest_position(0.5)
+                if pos is None:
+                    time.sleep(0.03)
+                    continue
+                x, y, max_x, max_y = pos
+                tx, ty = entry_target(edge, fraction, max_x, max_y)
+                if axis == "y":
+                    delta = ty - y
+                    req_x, req_y = 0, None
+                else:
+                    delta = tx - x
+                    req_x, req_y = None, 0
+                if abs(delta) <= 8:
+                    return
+                steps += 1
+                limit = 6 if steps <= 2 else 40
+                req = int(max(-limit, min(limit, round(delta / gain))))
+                if req == 0:
+                    req = 1 if delta > 0 else -1
+                if axis == "y":
+                    req_y = req
+                else:
+                    req_x = req
+                try:
+                    self.session.mouse_move(req_x or 0, req_y or 0)
+                except Exception:
+                    return
+                time.sleep(0.05)
+                moved = monitor.latest_position(0.5)
+                if moved is not None:
+                    step = (moved[1] - y) if axis == "y" else (moved[0] - x)
+                    if req and step * req < -2:
+                        return
+                    ratio = abs(step) / abs(req) if req else 0
+                    if ratio > 0.05:
+                        gain = max(0.3, min(8.0, 0.6 * gain + 0.4 * ratio))
+        finally:
+            # 无论对齐是否完成/中止，都立即恢复边缘检测，避免挡住用户回推。
             try:
-                self.session.mouse_move(req_x, req_y)
+                monitor.suppress_edges(0)
             except Exception:
-                return
-            time.sleep(0.1)
-            moved = monitor.latest_position(0.6)
-            if moved is not None:
-                ax = abs(moved[0] - x)
-                ay = abs(moved[1] - y)
-                ratio = None
-                if abs(dx) >= abs(dy) and req_x:
-                    ratio = ax / abs(req_x)
-                elif req_y:
-                    ratio = ay / abs(req_y)
-                if ratio is not None and ratio > 0.05:
-                    gain = max(0.3, min(4.0, 0.6 * gain + 0.4 * ratio))
+                pass
 
     def toggle_armed(self) -> None:
         if self.capture is None:

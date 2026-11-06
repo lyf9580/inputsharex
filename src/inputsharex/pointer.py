@@ -1,8 +1,21 @@
 """Lifecycle-bound Android cursor verifier; only samples while the PC owns the mouse."""
+import os
 import subprocess
 import threading
+import time
 
 from .adb import adb_env
+
+
+def _dbg(message: str) -> None:
+    path = os.environ.get("INPUTSHAREX_DEBUG_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(time.strftime("%H:%M:%S ") + "pointer: " + message + "\n")
+    except OSError:
+        pass
 
 
 class PointerMonitor:
@@ -37,8 +50,10 @@ class PointerMonitor:
                 if len(parts) == 2 and parts[0] == "READY":
                     self.pid = int(parts[1])
                     self.available = True
+                    _dbg(f"READY pid={self.pid}")
                     self._write()
                 elif len(parts) == 7 and parts[0] == "EDGE":
+                    _dbg("EDGE " + " ".join(parts[1:]))
                     self.on_edge({"generation": int(parts[1]), "placement": int(parts[2]),
                                   "x": float(parts[3]), "y": float(parts[4]),
                                   "max_x": float(parts[5]), "max_y": float(parts[6])})
@@ -62,6 +77,7 @@ class PointerMonitor:
 
     def set_enabled(self, enabled, generation, placement):
         self.desired = f"1 {int(generation)} {int(placement)}\n" if enabled else "0\n"
+        _dbg(f"set_enabled desired={self.desired.strip()} available={self.available} pid={self.pid}")
         self._write()
 
     def stop(self):

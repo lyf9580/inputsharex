@@ -95,6 +95,36 @@ def test_all_four_edges_use_real_coordinates():
     assert value.capture.return_from_device.call_count==4
 
 
+def test_return_position_uses_android_edge_fraction():
+    value=controller(); value._capture_generation=42
+    value.capture=Mock(armed=True,buttons=0)
+    value.config['placement']=0
+    value._on_verified_edge({'generation':42,'placement':0,'x':0,'y':800,'max_x':2135,'max_y':3199})
+    fraction=value.capture.return_from_device.call_args[0][0]
+    assert abs(fraction-800/3199)<1e-6
+    value._on_verified_edge({'generation':42,'placement':0,'x':0,'y':3199,'max_x':2135,'max_y':3199})
+    assert abs(value.capture.return_from_device.call_args[0][0]-1.0)<1e-6
+
+
+def test_edge_return_point_scales_both_axes():
+    rect=(0,0,2560,1600)
+    # 右侧返回：y 按比例落点，x 内缩 48
+    assert InputCapture._edge_return_point(0,0.0,rect,(2559,100))==(2512,1)
+    assert InputCapture._edge_return_point(0,1.0,rect,(2559,100))==(2512,1599)
+    assert InputCapture._edge_return_point(0,0.5,rect,(2559,100))==(2512,800)
+    # 左侧返回
+    assert InputCapture._edge_return_point(1,1.0,rect,(0,100))==(48,1599)
+    # 底部/顶部返回：x 按比例落点
+    assert InputCapture._edge_return_point(2,1.0,rect,(100,1599))==(2559,1552)
+    assert InputCapture._edge_return_point(3,0.0,rect,(100,0))==(1,48)
+
+
+def test_edge_return_point_without_fraction_keeps_old_behaviour():
+    rect=(0,0,2560,1600)
+    assert InputCapture._edge_return_point(0,None,rect,(2559,700))==(2512,700)
+    assert InputCapture._edge_return_point(2,None,rect,(900,1599))==(900,1552)
+
+
 def test_manual_profiles_survive_edit_and_deletion_does_not_reappear():
     from inputsharex.devices import build_device_entries
     value=controller()

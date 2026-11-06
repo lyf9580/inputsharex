@@ -16,6 +16,7 @@ v0.3.2 修复：
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 import time
 import uuid
@@ -26,6 +27,18 @@ from .keyboard import modifier_bit as _modifier_bit
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _dbg(message: str) -> None:
+    """边缘切换调试日志（仅当 INPUTSHAREX_DEBUG_LOG 指向可写文件时启用）。"""
+    path = os.environ.get("INPUTSHAREX_DEBUG_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(time.strftime("%H:%M:%S ") + message + "\n")
+    except OSError:
+        pass
 
 WM_INPUT = 0x00FF
 WM_HOTKEY = 0x0312
@@ -569,11 +582,16 @@ class InputCapture:
                 return
             pos = (point.x, point.y)
         left, top, right, bottom = _monitor_rect(pos[0], pos[1])
-        if not self.allow_extended_edge and (left, top, right, bottom) != _primary_monitor_rect():
+        primary = _primary_monitor_rect()
+        if not self.allow_extended_edge and (left, top, right, bottom) != primary:
             # 默认不把扩展显示器上撞边当成切换意图，避免外接屏用户频繁误触发。
+            _dbg(f"edge-skip-ext pos={pos} monitor={(left, top, right, bottom)} primary={primary}")
             return
         z = self.edge_zone
         edge = self.edge
+        near = pos[0] >= right - 1 - z * 4 or pos[0] <= left + z * 4 or pos[1] >= bottom - 1 - z * 4 or pos[1] <= top + z * 4
+        if near:
+            _dbg(f"edge-check pos={pos} dx={dx} dy={dy} monitor={(left, top, right, bottom)} edge={edge} z={z} can={self.can_capture()}")
         if edge == EDGE_RIGHT and dx > 0 and pos[0] >= right - 1 - z:
             self._enter(pos[0], pos[1], edge_mode=True)
         elif edge == EDGE_LEFT and dx < 0 and pos[0] <= left + z:
@@ -588,25 +606,44 @@ class InputCapture:
         # Return is requested after verifying Android's actual cursor position.
         return False
 
-    def return_from_device(self) -> None:
+    def return_from_device(self, fraction: float | None = None) -> None:
+        _dbg(f"return-from-device armed={self.armed} fraction={fraction}")
         if self.armed:
-            self._return_to_pc()
+            self._return_to_pc(fraction)
 
-    def _return_to_pc(self) -> None:
-        """从安卓端切回电脑：光标出现在原来那侧显示器边缘的内侧。"""
-        ax, ay = self._anchor
-        left, top, right, bottom = _monitor_rect(ax, ay)
-        m = 48
-        if self.edge == EDGE_RIGHT:
-            tx, ty = right - m, ay
-        elif self.edge == EDGE_LEFT:
-            tx, ty = left + m, ay
-        elif self.edge == EDGE_BOTTOM:
-            tx, ty = ax, bottom - m
+    @staticmethod
+    def _edge_return_point(edge: int, fraction: float | None,
+                           rect: tuple[int, int, int, int],
+                           anchor: tuple[int, int], inset: int = 48) -> tuple[int, int]:
+        """切回电脑时的落点：fraction 为安卓端沿共享边的比例（0=上/左，1=下/右）。
+
+        用于让电脑端光标落在同比例的边上，实现两边等比例衔接；None 时退回锚点。
+        """
+        left, top, right, bottom = rect
+        ax, ay = anchor
+        frac = None if fraction is None else min(max(float(fraction), 0.0), 1.0)
+        if edge == EDGE_RIGHT:
+            tx = right - inset
+            ty = ay if frac is None else top + round(frac * (bottom - top - 1))
+        elif edge == EDGE_LEFT:
+            tx = left + inset
+            ty = ay if frac is None else top + round(frac * (bottom - top - 1))
+        elif edge == EDGE_BOTTOM:
+            ty = bottom - inset
+            tx = ax if frac is None else left + round(frac * (right - left - 1))
         else:
-            tx, ty = ax, top + m
+            ty = top + inset
+            tx = ax if frac is None else left + round(frac * (right - left - 1))
         tx = min(max(tx, left + 1), right - 1)
         ty = min(max(ty, top + 1), bottom - 1)
+        return tx, ty
+
+    def _return_to_pc(self, fraction: float | None = None) -> None:
+        """从安卓端切回电脑：光标出现在原来那侧显示器边缘的内侧。"""
+        ax, ay = self._anchor
+        rect = _monitor_rect(ax, ay)
+        tx, ty = self._edge_return_point(self.edge, fraction, rect, (ax, ay))
+        _dbg(f"return-mapped edge={self.edge} fraction={fraction} anchor={(ax, ay)} monitor={rect} target={(tx, ty)}")
         self._leave((tx, ty))
         self.on_edge(self.edge, False)
 
@@ -624,7 +661,9 @@ class InputCapture:
 
     def _enter(self, x: int, y: int, edge_mode: bool) -> None:
         if self.armed or not self.can_capture():
+            _dbg(f"enter-rejected x={x} y={y} edge_mode={edge_mode} armed={self.armed} can={self.can_capture()}")
             return
+        _dbg(f"enter-accepted x={x} y={y} edge_mode={edge_mode}")
         self._anchor = (x, y)
         self._acc_x = 0
         self._acc_y = 0
@@ -671,6 +710,7 @@ class InputCapture:
     def _leave(self, pos: tuple[int, int]) -> None:
         if not self.armed:
             return
+        _dbg(f"leave-armed pos={pos} edge_mode={self.edge_mode}")
         self.armed = False
         self.edge_mode = False
         self._kb_mods = 0

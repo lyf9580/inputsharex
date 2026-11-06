@@ -21,7 +21,7 @@ from .androidapp import (
     ensure_installed as ensure_android_app_installed,
     launch as launch_android_app,
 )
-from .capture import InputCapture, MOD_ALT, MOD_CONTROL, VK_Q
+from .capture import InputCapture, MOD_ALT, MOD_CONTROL, VK_Q, _dbg as _dbg_edge
 from .link import DeviceLink
 from .pairing import (
     DEFAULT_WATCH_TIMEOUT,
@@ -238,6 +238,7 @@ class AppController(QObject):
                 and event.get("generation") == self._capture_generation
                 and event.get("placement") == self.config.get("placement", 0)
                 and self.config.get("placement", 0) in range(4)):
+            _dbg_edge(f"verified-edge-rejected event={event} armed={getattr(self.capture, 'armed', None)} gen={self._capture_generation}")
             return
         try:
             x, y, mx, my = (float(event[k]) for k in ("x", "y", "max_x", "max_y"))
@@ -249,7 +250,13 @@ class AppController(QObject):
             return
         boundary = (x <= .5, x >= mx - .5, y <= .5, y >= my - .5)[self.config.get("placement", 0)]
         if boundary:
-            self.capture.return_from_device()
+            # 安卓端沿共享边的比例位置：横向相邻取 y，纵向相邻取 x；
+            # 坐标已在探针里换算成当前旋转后的逻辑坐标，因此横竖屏都通用。
+            if self.config.get("placement", 0) in (0, 1):
+                fraction = y / my
+            else:
+                fraction = x / mx
+            self.capture.return_from_device(fraction)
 
     def start_sharing_on_connect(self):
         self._auto_start_requested = True
@@ -770,6 +777,7 @@ class AppController(QObject):
     def _on_arm_toggle(self, armed: bool) -> None:
         self._armed = armed
         self._capture_generation = time.time_ns()
+        _dbg_edge(f"arm-toggle armed={armed} gen={self._capture_generation} probe_available={getattr(self.pointer_monitor, 'available', None)}")
         if self.pointer_monitor:
             self.pointer_monitor.set_enabled(armed, self._capture_generation, self.config.get("placement", 0))
         if not armed:

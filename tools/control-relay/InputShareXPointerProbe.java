@@ -14,6 +14,13 @@ public final class InputShareXPointerProbe {
     private static volatile String command = "0";
     private static final Pattern DEVICE_STATE = Pattern.compile("(?:DeviceId\\()?(\\d+)\\)?:\\[");
     private static final Pattern POINT = Pattern.compile("hoveringPointers=\\[Pointer\\(id=\\d+, MOUSE\\) at \\(([-0-9.]+), ([-0-9.]+)\\)");
+    // InputDispatcher 里的鼠标坐标是“未旋转的物理/自然坐标”，而窗口/显示已经按 ROTATION_* 旋转；
+    // 直接拿它和放置方向比较，设备一转屏（横竖切换）边缘就判断错了。这里从同一份 dump 中解析
+    // 当前显示的逻辑尺寸与旋转矩阵，把指针坐标换算成逻辑坐标后再判断边缘。
+    private static final Pattern DISPLAY_INFO = Pattern.compile(
+        "logicalSize=(\\d+)x(\\d+)[^\\n]*\\n\\s*transform[^\\n]*\\n"
+        + "\\s*([-0-9.]+)\\s+([-0-9.]+)\\s+([-0-9.]+)\\s*\\n"
+        + "\\s*([-0-9.]+)\\s+([-0-9.]+)\\s+([-0-9.]+)");
 
     public static void main(String[] args) throws Exception {
         IBinder input = (IBinder) Class.forName("android.os.ServiceManager")
@@ -56,9 +63,11 @@ public final class InputShareXPointerProbe {
                         InputDevice.MotionRange rx = mouse.getMotionRange(MotionEvent.AXIS_X);
                         InputDevice.MotionRange ry = mouse.getMotionRange(MotionEvent.AXIS_Y);
                         if (rx != null && ry != null && rx.getMax() > 0 && ry.getMax() > 0) {
-                            float[] point = findPoint(dumpInput(input, dumper), mouse.getId());
+                            String dump = dumpInput(input, dumper);
+                            float[] point = findPoint(dump, mouse.getId());
                             if (point != null && current.equals(command)) {
-                                float x = point[0], y = point[1], maxX = rx.getMax(), maxY = ry.getMax();
+                                float[] logical = logicalPoint(dump, point[0], point[1], rx.getMax(), ry.getMax());
+                                float x = logical[0], y = logical[1], maxX = logical[2], maxY = logical[3];
                                 if (!positionReported) {
                                     System.out.println("POSITION " + parts[1] + " " + mouse.getId() + " " + x + " " + y + " " + maxX + " " + maxY);
                                     System.out.flush();
@@ -97,6 +106,30 @@ public final class InputShareXPointerProbe {
         }
         writing.get(2, TimeUnit.SECONDS);
         return data.toString("UTF-8");
+    }
+
+    /**
+     * 把 InputDispatcher 的自然方向指针坐标换算成屏幕逻辑坐标。
+     * 设备旋转后 dump 会给出 display 的 logicalSize 和 3x3 变换矩阵（自然坐标 -> 逻辑坐标），
+     * 解析失败时退回原始坐标与 MotionRange，保持旧行为。
+     */
+    private static float[] logicalPoint(String dump, float nx, float ny, float rawMaxX, float rawMaxY) {
+        try {
+            Matcher m = DISPLAY_INFO.matcher(dump);
+            if (!m.find()) return new float[]{nx, ny, rawMaxX, rawMaxY};
+            int w = Integer.parseInt(m.group(1));
+            int h = Integer.parseInt(m.group(2));
+            float a = Float.parseFloat(m.group(3)), b = Float.parseFloat(m.group(4)), c = Float.parseFloat(m.group(5));
+            float d = Float.parseFloat(m.group(6)), e = Float.parseFloat(m.group(7)), f = Float.parseFloat(m.group(8));
+            float maxX = w - 1f, maxY = h - 1f;
+            float lx = a * nx + b * ny + c;
+            float ly = d * nx + e * ny + f;
+            lx = Math.max(0f, Math.min(maxX, lx));
+            ly = Math.max(0f, Math.min(maxY, ly));
+            return new float[]{lx, ly, maxX, maxY};
+        } catch (RuntimeException ignored) {
+            return new float[]{nx, ny, rawMaxX, rawMaxY};
+        }
     }
 
     private static float[] findPoint(String dump, int id) {

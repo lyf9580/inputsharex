@@ -838,58 +838,58 @@ class AppController(QObject):
         except Exception:
             pass
 
-    def _pre_align_parallel(self, fraction: float) -> None:
-        """Move the Android cursor to the proportional landing point.
+    def _glide_parallel(self, axis: int, units: int) -> None:
+        """Send a relative move in small chunks so acceleration stays linear."""
+        session = self.session
+        if session is None:
+            return
+        chunk = 40
+        try:
+            while units:
+                step = max(-chunk, min(chunk, units))
+                if axis == 1:
+                    session.mouse_move(0, step)
+                else:
+                    session.mouse_move(step, 0)
+                units -= step
+                time.sleep(0.012)
+        except Exception:
+            return
 
-        The Android side only accepts relative mouse reports and a remote
-        position dump costs ~350 ms, so a closed loop here can never be as
-        fast as the local Windows return.  Instead we predict the required
-        relative move from the last known Android position (captured on the
-        previous edge-return) and send it in one go; a single asynchronous
-        correction runs after capture arms.
+    def _pre_align_parallel(self, fraction: float) -> None:
+        """Glide toward the landing point before the capture becomes visible.
+
+        The Android side only accepts relative reports, so the landing can
+        never be as instant as the local Windows return; chunked moves keep
+        the pointer acceleration predictable and avoid visible overshoot.
         """
         session = self.session
         monitor = self.pointer_monitor
         if session is None or monitor is None or session.closed or not self._sharing:
             return
-        edge = int(self.config.get("placement", 0))
         last = self._last_android_pos
         if last is None:
-            # No cached position yet (first entry after app start).  Do not
-            # stall the capture here: the post-arm verify thread will read the
-            # live position and correct once the device is captured.
-            _dbg_edge("pre-align-predict no-cache")
+            _dbg_edge("entry-target no-cache")
             return
         px, py, max_x, max_y = last
+        edge = int(self.config.get("placement", 0))
         tx, ty = entry_target(edge, fraction, max_x, max_y)
         if edge in (0, 1):
-            cur, target = py, ty
-            axis = 1
+            cur, target, axis = py, ty, 1
         else:
-            cur, target = px, tx
-            axis = 0
+            cur, target, axis = px, tx, 0
         remaining = target - cur
-        if abs(remaining) <= 24:
-            _dbg_edge("pre-align-predict skip remaining=%.1f" % remaining)
-            return
-        units = int(round(remaining / self._align_rate))
-        units = max(-800, min(800, units))
-        if units == 0:
-            units = 1 if remaining > 0 else -1
-        try:
-            if axis == 1:
-                session.mouse_move(0, units)
-            else:
-                session.mouse_move(units, 0)
-        except Exception:
-            return
         _dbg_edge(
-            "pre-align-predict remaining=%.1f units=%d rate=%.2f"
-            % (remaining, units, self._align_rate)
+            "entry-target cached=(%.1f,%.1f) target=(%.1f,%.1f) remaining=%.1f"
+            % (px, py, tx, ty, remaining)
         )
+        if abs(remaining) <= 12:
+            return
+        # Deliberately no movement before the capture arms: a wrong prediction
+        # is visible as a jump.  The post-arm verify thread glides instead.
 
     def _verify_entry_alignment(self, fraction: float) -> None:
-        """Correct the predicted landing and learn the real Android rate."""
+        """Correct the landing after capture; measured, low-gain steps."""
         session = self.session
         monitor = self.pointer_monitor
         if session is None or monitor is None:
@@ -917,7 +917,7 @@ class AppController(QObject):
         if pos is None:
             _dbg_edge("align-verify no-position")
             return
-        for attempt in range(5):
+        for attempt in range(6):
             if not self._armed or self._sharing is not True:
                 return
             if getattr(self.capture, "user_move_units", 0) - units_before > 6:
@@ -934,22 +934,14 @@ class AppController(QObject):
                 "align-verify attempt=%d error=%.1f rate=%.2f"
                 % (attempt, error, self._align_rate)
             )
-            if abs(error) <= 24:
+            if abs(error) <= 12:
                 return
-            units = int(round(error / self._align_rate))
-            units = max(-700, min(700, units))
-            if units == 0:
-                units = 1 if error > 0 else -1
-            try:
-                if axis == 1:
-                    session.mouse_move(0, units)
-                else:
-                    session.mouse_move(units, 0)
-            except Exception:
-                return
+            units = int(round(error / max(self._align_rate, 0.5) * 0.85))
+            units = max(-120, min(120, units))
+            self._glide_parallel(axis, units)
             sent_at = time.monotonic()
             new_pos = None
-            while time.monotonic() - sent_at < 0.7:
+            while time.monotonic() - sent_at < 0.6:
                 candidate = monitor.latest_position(0.5)
                 if candidate is not None and monitor.position_at >= sent_at:
                     new_pos = candidate
@@ -961,7 +953,7 @@ class AppController(QObject):
             npx, npy, _, _ = new_pos
             new_cur = npy if axis == 1 else npx
             moved = new_cur - cur
-            if abs(units) > 0 and abs(moved) >= 1:
+            if abs(units) > 0 and abs(moved) >= 2:
                 observed = abs(moved) / float(abs(units))
                 if 0.2 <= observed <= 400.0:
                     self._align_rate = max(0.2, min(400.0, observed))

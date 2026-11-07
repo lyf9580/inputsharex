@@ -20,6 +20,19 @@ InputShareX 的配套 Android App：电脑（Windows）端把键盘鼠标共享�
 
 ## 构建
 
+调试构建使用本机的 Android 调试签名。正式发布使用专用密钥，密钥文件和密码存放在仓库之外。
+
+在 GitHub 仓库的 Actions secrets 中配置下列四项，再推送发布标签。
+
+| Secret | 内容 |
+| --- | --- |
+| `ANDROID_RELEASE_KEYSTORE_BASE64` | 新发布 keystore 文件的 Base64 编码 |
+| `ANDROID_RELEASE_STORE_PASSWORD` | keystore 密码 |
+| `ANDROID_RELEASE_KEY_ALIAS` | 签名密钥别名 |
+| `ANDROID_RELEASE_KEY_PASSWORD` | 签名密钥密码 |
+
+本地构建正式 APK 时，用 `ANDROID_RELEASE_KEYSTORE` 指定密钥文件的绝对路径，设置其余三个同名环境变量，然后运行 `:app:assembleRelease`。请备份发布密钥，后续版本沿用该密钥以支持覆盖更新。标签构建会拒绝旧的公开调试证书，并在缺少签名配置时停止。
+
 环境要求：
 
 - JDK 17 或以上（已验证 JDK 21）

@@ -12,29 +12,29 @@ android {
         applicationId = "com.inputsharex.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.3.1"
+        versionCode = 17
+        versionName = "0.3.5"
     }
 
-    signingConfigs {
-        // 固定的自签名密钥（标准 Android debug keystore），提交在仓库里：
-        // 这样本地和 GitHub Actions 构建出的 APK 签名一致，用户可以直接覆盖安装更新。
-        create("shared") {
-            storeFile = file("../keystore/inputsharex-debug.jks")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+    val releaseKeystore = providers.environmentVariable("ANDROID_RELEASE_KEYSTORE").orNull
+    val releaseStorePassword = providers.environmentVariable("ANDROID_RELEASE_STORE_PASSWORD").orNull
+    val releaseKeyAlias = providers.environmentVariable("ANDROID_RELEASE_KEY_ALIAS").orNull
+    val releaseKeyPassword = providers.environmentVariable("ANDROID_RELEASE_KEY_PASSWORD").orNull
+
+    if (releaseKeystore != null) {
+        signingConfigs.create("production") {
+            storeFile = file(releaseKeystore)
+            storePassword = requireNotNull(releaseStorePassword)
+            keyAlias = requireNotNull(releaseKeyAlias)
+            keyPassword = requireNotNull(releaseKeyPassword)
         }
     }
 
     buildTypes {
-        debug {
-            signingConfig = signingConfigs.getByName("shared")
-        }
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("shared")
+            signingConfig = signingConfigs.findByName("production")
         }
     }
 

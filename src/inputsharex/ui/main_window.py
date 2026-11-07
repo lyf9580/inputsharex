@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -399,6 +400,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(link_card)
 
         mouse = Card("鼠标控制", "指针接管与触控映射")
+        self.mouse_speed_spin = QDoubleSpinBox()
+        self.mouse_speed_spin.setRange(0.25, 6.0)
+        self.mouse_speed_spin.setSingleStep(0.25)
+        self.mouse_speed_spin.setDecimals(2)
+        self.mouse_speed_spin.setSuffix(" ×")
+        self.mouse_speed_spin.setKeyboardTracking(False)
+        mouse.add_row("安卓鼠标速率", "0.25–6 倍，默认 3.75 倍；调节后立即生效", self.mouse_speed_spin)
+        self.cursor_size_spin = QDoubleSpinBox()
+        self.cursor_size_spin.setRange(1.0, 4.0)
+        self.cursor_size_spin.setSingleStep(0.25)
+        self.cursor_size_spin.setDecimals(2)
+        self.cursor_size_spin.setSuffix(" ×")
+        self.cursor_size_spin.setKeyboardTracking(False)
+        mouse.add_row("安卓光标大小", "1–4 倍，默认 1.5 倍；箭头尖端始终对应点击位置", self.cursor_size_spin)
         self.edge_switch = self._new_switch()
         mouse.add_row(
             "边缘切换",
@@ -1003,6 +1018,8 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 combo.setCurrentIndex(index)
 
+        self.mouse_speed_spin.setValue(float(config.get("mouse_speed", 3.75)))
+        self.cursor_size_spin.setValue(float(config.get("cursor_scale", 1.5)))
         select(self.hotkey_combo, config.get("hotkey", "ctrl+alt+q"))
         select(self.keepalive_combo, config.get("keepalive_ms", 8))
         select(self.cadence_combo, config.get("cadence_ms", 4))
@@ -1025,6 +1042,8 @@ class MainWindow(QMainWindow):
             cap.setText(_hotkey_label(str(config.get("hotkey") or "ctrl+alt+q")))
 
     def _wire_settings(self) -> None:
+        self.mouse_speed_spin.valueChanged.connect(lambda value: self._save(mouse_speed=value))
+        self.cursor_size_spin.valueChanged.connect(lambda value: self._save(cursor_scale=value))
         self.autostart_switch.toggled.connect(self._on_autostart_toggled)
         self.start_armed_switch.toggled.connect(
             lambda checked: self._save(start_armed=checked)

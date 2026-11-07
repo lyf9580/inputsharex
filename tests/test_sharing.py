@@ -29,6 +29,114 @@ def incoming(value, message):
     value._handle_android_message({"source": value.device_link, "message": message})
 
 
+def test_absolute_entry_sent_before_buffered_motion_and_keyboard_creation():
+    value = controller()
+    value.session = Mock(absolute_mouse=True)
+    value.pointer_monitor = None
+    value._enter_fraction = 0.25
+    events = []
+    value.session.enter_pointer.side_effect = lambda *args: events.append(("entry", args))
+    value.session.create_keyboard.side_effect = lambda *args: events.append(("keyboard", args))
+    value.capture = InputCapture(on_move=lambda *args: events.append(("move", args)))
+    value.capture.armed = True
+    value.capture.entry_ticket = object()
+    value.capture._entry_dx, value.capture._entry_dy = 70, 3
+    value._on_arm_toggle(True)
+    assert [kind for kind, args in events] == ["entry", "move", "keyboard"]
+    assert events[0][1] == (0, 0.25)
+    assert value.capture.entry_ticket is None
+
+
+def test_mouse_input_is_buffered_then_flushed_before_click():
+    import ctypes
+    from inputsharex.capture import RAWINPUT, RI_MOUSE_LEFT_BUTTON_DOWN
+
+    events = []
+    capture = InputCapture(
+        on_move=lambda *args: events.append(("move", args)),
+        on_button=lambda buttons: events.append(("button", buttons)),
+    )
+    capture.armed = True
+    capture.entry_ticket = object()
+    capture._warp = Mock()
+    raw = RAWINPUT()
+    raw.mouse.lLastX = 70
+    raw.mouse.lLastY = 3
+
+    def read_raw(handle, command, output, size, header_size):
+        ctypes.memmove(output, ctypes.byref(raw), ctypes.sizeof(raw))
+        return ctypes.sizeof(raw)
+
+    with patch("inputsharex.capture.user32.GetRawInputData", side_effect=read_raw):
+        capture._handle_raw_input(0)
+        assert events == []
+        raw.mouse.buttons.btns.usButtonFlags = RI_MOUSE_LEFT_BUTTON_DOWN
+        raw.mouse.lLastX, raw.mouse.lLastY = 5, 0
+        capture._handle_raw_input(0)
+
+    assert events == [
+        ("move", (70, 3, 0)), ("button", 1), ("move", (5, 0, 1)),
+    ]
+    assert capture.entry_ticket is None
+
+
+def test_crossing_return_does_not_warp_back_to_old_anchor():
+    import ctypes
+    from inputsharex.capture import RAWINPUT
+
+    for edge, fraction in ((0, .2), (0, .8), (1, .3), (2, .7), (3, .4)):
+        capture = InputCapture(edge=edge)
+        capture.armed = True
+        capture._anchor = (1900, 500)
+        capture._trap = None
+        capture.on_move = lambda *args: capture.return_from_device(fraction)
+        raw = RAWINPUT()
+        raw.mouse.lLastX = -10
+        raw.mouse.lLastY = 12
+
+        def read_raw(handle, command, output, size, header_size):
+            ctypes.memmove(output, ctypes.byref(raw), ctypes.sizeof(raw))
+            return ctypes.sizeof(raw)
+
+        rect = (0, 0, 1920, 1080)
+        expected = capture._edge_return_point(edge, fraction, rect, capture._anchor)
+        with patch('inputsharex.capture.user32') as windows, \
+                patch('inputsharex.capture._monitor_rect', return_value=rect):
+            windows.GetRawInputData.side_effect = read_raw
+            capture._handle_raw_input(0)
+            assert not capture.armed
+            windows.SetCursorPos.assert_called_once_with(*expected)
+            windows.ClipCursor.assert_called_once_with(None)
+
+
+def test_ime_restores_original_device_when_sharing_stops_during_write():
+    value = controller()
+    original_serial = value.serial
+    value._sharing = True
+    value.adb = Mock()
+    value._android_screen_size = Mock(return_value=None)
+    value._teardown_sharing = Mock()
+
+    def adb_settings(serial, *args, **kwargs):
+        if args[:4] == ("shell", "settings", "get", "secure"):
+            return Mock(returncode=0, stdout=b"null\n")
+        if args[:4] == ("shell", "settings", "put", "secure"):
+            value._sharing = False
+            value.serial = "192.168.1.3:37123"
+        return Mock(returncode=0)
+
+    value.adb.run_for.side_effect = adb_settings
+    with patch("inputsharex.app.ScrcpyServer"), patch("inputsharex.app.ControlSession"), \
+            patch("inputsharex.app.enable_background_wifi_lock", return_value=False):
+        value._sharing_worker(False)
+
+    assert [call.args for call in value.adb.run_for.call_args_list] == [
+        (original_serial, "shell", "settings", "get", "secure", value._IME_SETTING),
+        (original_serial, "shell", "settings", "put", "secure", value._IME_SETTING, "1"),
+        (original_serial, "shell", "settings", "delete", "secure", value._IME_SETTING),
+    ]
+
+
 def test_next_connection_auto_share_preference_is_respected():
     value = controller()
     incoming(value, {"type": "hello", "auto_share": False})
@@ -213,7 +321,9 @@ def test_repeated_native_capture_start_uses_current_callback_and_cleans_windows(
     for index in range(6):
         seen = []
         capture = InputCapture(edge_switch=False)
-        capture._handle_raw_input = lambda value, target=seen: target.append(value)
+        capture._handle_raw_input = lambda value, target=seen, expected=1000 + index: (
+            target.append(value) if value == expected else None
+        )
         try:
             capture.start()
             user32.PostMessageW(capture._hwnd, WM_INPUT, 0, 1000 + index)

@@ -66,7 +66,13 @@ def _boost_thread_priority(priority: int = 2) -> None:
 
 class ControlSession:
     def __init__(self, sock: socket.socket, keepalive_interval: float = 0.008,
-                 cadence_ms: float = 4.0):
+                 cadence_ms: float = 4.0, *, absolute_mouse: bool = False):
+        self.absolute_mouse = absolute_mouse
+        self._pointer_x = self._pointer_y = 0
+        self._pointer_precise_x = self._pointer_precise_y = 0.0
+        self.pointer_speed = 3.75
+        self.cursor_scale = 1.5
+        self._pointer_active = False
         self.sock = sock
         self.keepalive_interval = keepalive_interval
         self.cadence = max(cadence_ms, 0.0) / 1000.0
@@ -112,7 +118,7 @@ class ControlSession:
     # -- raw send --------------------------------------------------
     def _send_locked(self, payload: bytes) -> None:
         try:
-            self.sock.sendall(payload)
+            self.sock.sendall((struct.pack(">I", len(payload)) if self.absolute_mouse else b"") + payload)
         except OSError:
             self._closed = True
             return
@@ -132,7 +138,8 @@ class ControlSession:
 
     # -- setup -----------------------------------------------------
     def create_mouse(self, name: str = "inputsharex") -> None:
-        self.send(protocol.uhid_create(hid.HID_MOUSE_ID, name, hid.MOUSE_DESCRIPTOR))
+        if not self.absolute_mouse:
+            self.send(protocol.uhid_create(hid.HID_MOUSE_ID, name, hid.MOUSE_DESCRIPTOR))
 
     def create_keyboard(self, name: str = "inputsharex") -> None:
         """创建 UHID 键盘设备（只在接管期间需要）。重复调用无副作用。"""
@@ -152,7 +159,10 @@ class ControlSession:
         self._kb_created = False
 
     def destroy_devices(self) -> None:
-        self.send(protocol.uhid_destroy(hid.HID_MOUSE_ID))
+        if self.absolute_mouse:
+            self.leave_pointer()
+        else:
+            self.send(protocol.uhid_destroy(hid.HID_MOUSE_ID))
         self.send(protocol.uhid_destroy(hid.HID_KEYBOARD_ID))
         self._kb_mods = 0
         self._kb_keys = []
@@ -168,8 +178,17 @@ class ControlSession:
                 self.mouse_buttons = buttons & 0x1F
             if not self._dirty:
                 self._pending_since = time.perf_counter()
-            self._dx += dx
-            self._dy += dy
+            if self.absolute_mouse:
+                if not self._pointer_active:
+                    return
+                w, h = self._screen_size or (2, 2)
+                self._pointer_precise_x = max(0, min(w - 1, self._pointer_precise_x + dx * self.pointer_speed))
+                self._pointer_precise_y = max(0, min(h - 1, self._pointer_precise_y + dy * self.pointer_speed))
+                self._pointer_x = round(self._pointer_precise_x)
+                self._pointer_y = round(self._pointer_precise_y)
+            else:
+                self._dx += dx
+                self._dy += dy
             if dx or dy:
                 self._dirty = True
 
@@ -191,9 +210,8 @@ class ControlSession:
             if self._closed:
                 return
             self.mouse_buttons = buttons
-            payload = protocol.uhid_input(
-                hid.HID_MOUSE_ID, hid.mouse_report(buttons, 0, 0)
-            )
+            payload = (self._absolute_packet(protocol.ABS_BUTTONS) if self.absolute_mouse else
+                protocol.uhid_input(hid.HID_MOUSE_ID, hid.mouse_report(buttons, 0, 0)))
             self._send_locked(payload)
             self.sent_bytes += len(payload)
             self.sent_messages += 1
@@ -274,9 +292,71 @@ class ControlSession:
 
     # -- 剪贴板同步 ------------------------------------------------
     def set_screen_size(self, width: int, height: int) -> None:
-        """记录安卓当前逻辑分辨率（横屏时宽高已互换），供手势注入使用。"""
-        if width > 0 and height > 0:
-            self._screen_size = (int(width), int(height))
+        if 1 < width <= 65535 and 1 < height <= 65535:
+            with self._lock:
+                old = self._screen_size
+                if old and old != (width, height):
+                    self._pointer_x = round(self._pointer_x * (width - 1) / (old[0] - 1))
+                    self._pointer_y = round(self._pointer_y * (height - 1) / (old[1] - 1))
+                    self._pointer_precise_x, self._pointer_precise_y = float(self._pointer_x), float(self._pointer_y)
+                self._screen_size = (int(width), int(height))
+
+    def _absolute_packet(self, action: int, horizontal=0, vertical=0) -> bytes:
+        w, h = self._screen_size or (2, 2)
+        return protocol.absolute_mouse(action, self.mouse_buttons, self._pointer_x,
+                                       self._pointer_y, w, h, horizontal, vertical)
+
+    def set_pointer_speed(self, value: float) -> None:
+        value = float(value)
+        if not math.isfinite(value) or not 0.25 <= value <= 6.0:
+            raise ValueError("Mouse speed must be between 0.25 and 6")
+        with self._lock:
+            self.pointer_speed = value
+
+    def set_cursor_scale(self, value: float) -> None:
+        value = float(value)
+        if not math.isfinite(value) or not 1.0 <= value <= 4.0:
+            raise ValueError("Cursor size must be between 1 and 4")
+        with self._lock:
+            self.cursor_scale = value
+            if self.absolute_mouse and not self._closed:
+                self._send_locked(self._absolute_packet(protocol.ABS_CONFIG, horizontal=value))
+
+    def enter_pointer(self, edge: int, fraction: float | None) -> None:
+        from .geometry import absolute_entry
+        with self._lock:
+            if self._screen_size is None:
+                raise RuntimeError("Android display dimensions unavailable")
+            if fraction is not None:
+                self._pointer_x, self._pointer_y = absolute_entry(edge, fraction, *self._screen_size)
+            self._pointer_precise_x, self._pointer_precise_y = float(self._pointer_x), float(self._pointer_y)
+            self._pointer_active = True
+            self.mouse_buttons = 0
+            self._dx = self._dy = self._wheel = self._pan = 0
+            self._dirty = False
+            self._send_locked(self._absolute_packet(protocol.ABS_ENTER))
+
+    def leave_pointer(self) -> None:
+        if not self.absolute_mouse:
+            return
+        with self._lock:
+            self.mouse_buttons = 0
+            self._pointer_active = False
+            self._dx = self._dy = self._wheel = self._pan = 0
+            self._dirty = False
+            if not self._closed:
+                self._send_locked(self._absolute_packet(protocol.ABS_LEAVE))
+
+    def return_fraction(self, edge: int, dx: int, dy: int) -> float | None:
+        with self._lock:
+            if not self._pointer_active or self.mouse_buttons or not self._screen_size:
+                return None
+            w, h = self._screen_size
+            x, y = self._pointer_x, self._pointer_y
+            # Require movement out through the shared edge, so entry never bounces back.
+            boundary = (x == 0 and dx < 0, x == w - 1 and dx > 0,
+                        y == 0 and dy < 0, y == h - 1 and dy > 0)[edge]
+            return (y / (h - 1) if edge < 2 else x / (w - 1)) if boundary else None
 
     def set_clipboard_text(self, text: str, paste: bool = False) -> bool:
         """把电脑端剪贴板文本写到安卓端。返回是否真的发出。"""
@@ -411,6 +491,12 @@ class ControlSession:
         return [sign * (base + (1 if i < rem else 0)) for i in range(parts)]
 
     def _build_tick_locked(self) -> bytes:
+        if self.absolute_mouse:
+            payload = self._absolute_packet(protocol.ABS_SCROLL if self._wheel or self._pan else protocol.ABS_MOVE,
+                                            self._pan, self._wheel)
+            self._dx = self._dy = self._wheel = self._pan = 0
+            self._dirty = False
+            return payload if self._pointer_active else b""
         chunks: list[bytes] = []
         dx, dy = self._dx, self._dy
         wheel, pan = self._wheel, self._pan
@@ -479,6 +565,8 @@ class ControlSession:
                         keepalive = protocol.uhid_input(
                             hid.HID_MOUSE_ID, hid.mouse_report(self.mouse_buttons, 0, 0)
                         )
+                        if self.absolute_mouse:
+                            keepalive = self._absolute_packet(protocol.ABS_KEEPALIVE)
                         self._send_locked(keepalive)
                         self.sent_bytes += len(keepalive)
                         self.sent_messages += 1

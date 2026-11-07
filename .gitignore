@@ -22,3 +22,8 @@ vendor/inputsharex-android.apk
 docs/CODEX_HANDOFF.md
 docs/DEEPSEEK_HANDOFF.md
 docs/WIFI_BACKGROUND_FINDINGS.md
+
+# Local Android signing files and CI staging output
+*.jks
+*.keystore
+/android/inputsharex-android.apk

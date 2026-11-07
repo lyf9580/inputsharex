@@ -55,6 +55,34 @@ def _make_apk() -> str:
     return handle.name
 
 
+def test_old_companion_is_upgraded_for_absolute_backend():
+    apk = _make_apk()
+    try:
+        adb = FakeAdb([INSTALLED_TEXT, INSTALLED_TEXT.replace("0.2.2", "0.3.3")])
+        assert androidapp.ensure_installed(adb, "s", apk_path=apk, open_app=False,
+                                           minimum_version="0.3.3")
+        assert len(adb.install_calls) == 1
+    finally:
+        os.unlink(apk)
+
+
+def test_upgrade_rejects_bundled_apk_that_is_still_too_old():
+    apk = _make_apk()
+    try:
+        adb = FakeAdb([INSTALLED_TEXT])
+        assert not androidapp.ensure_installed(adb, "s", apk_path=apk, open_app=False,
+                                               minimum_version="0.3.3")
+    finally:
+        os.unlink(apk)
+
+
+def test_newer_companion_is_not_downgraded():
+    adb = FakeAdb([INSTALLED_TEXT.replace("0.2.2", "0.4.0")])
+    assert androidapp.ensure_installed(adb, "s", apk_path="/nonexistent.apk",
+                                       minimum_version="0.3.3")
+    assert not adb.install_calls
+
+
 def test_parse_dumpsys_installed():
     installed, version = androidapp.parse_dumpsys(INSTALLED_TEXT)
     assert installed is True

@@ -55,7 +55,8 @@ class ScrcpyServer:
     """管理一次服务端运行。用法：with ScrcpyServer(adb, serial) as server: server.sock"""
 
     def __init__(self, adb: Adb, serial: str, local_port: int = DEFAULT_LOCAL_PORT,
-                 jar_path: str | None = None, log_level: str = "info", direct: bool = False):
+                 jar_path: str | None = None, log_level: str = "info", direct: bool = False,
+                 absolute_mouse: bool = False, cursor_setup=None):
         self.adb = adb
         self.serial = serial
         adb.serial = serial  # 后续所有 adb 命令都带上 -s，避免多设备/多 serial 歧义
@@ -64,6 +65,8 @@ class ScrcpyServer:
         self.log_level = log_level
         self.proc: subprocess.Popen | None = None
         self.sock: socket.socket | None = None
+        self.absolute_mouse = absolute_mouse
+        self.cursor_setup = cursor_setup
         self.direct = direct and ":" in serial
         self.transport = "adb"
         self.direct_error = ""
@@ -169,16 +172,19 @@ class ScrcpyServer:
         if self.local_port != requested:
             print(f"[*] 本地端口 {requested} 被占用，改用 {self.local_port}")
         self._start()
-        if self.direct:
+        if self.direct or self.absolute_mouse:
             from .direct import DirectControlRelay
             self.relay = DirectControlRelay(self.adb, self.serial,
-                os.path.join(os.path.dirname(self.jar_path), "inputsharex-relay.jar"))
+                os.path.join(os.path.dirname(self.jar_path), "inputsharex-relay.jar"),
+                absolute_mouse=self.absolute_mouse, cursor_setup=self.cursor_setup, direct=self.direct)
             try:
                 self.sock = self.relay.start()
-                self._read_device_meta(self.sock, consume_dummy=True)
-                self.transport = "tls-direct"
+                self._read_device_meta(self.sock, consume_dummy=False)
+                self.transport = "tls-direct" if self.direct else "adb"
                 return self.sock
             except (OSError, RuntimeError, ValueError, ImportError, subprocess.SubprocessError) as exc:
+                if not self.direct:
+                    raise
                 self.direct_error = str(exc)
                 self.stop()
                 self.direct = False

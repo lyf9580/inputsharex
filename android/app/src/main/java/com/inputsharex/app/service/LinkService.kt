@@ -88,6 +88,7 @@ class LinkService : Service() {
     }
 
     private lateinit var scope: CoroutineScope
+    private var cursor: com.inputsharex.app.overlay.CursorOverlayServer? = null
     private var client: LinkClient? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -103,10 +104,19 @@ class LinkService : Service() {
         super.onCreate()
         activeService = this
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val link = LinkClient(scope) { SettingsStore.settings.value }
+        cursor = com.inputsharex.app.overlay.CursorOverlayServer(this) { x, y, w, h ->
+            client?.reportCursor(x, y, w, h)
+        }
+        val link = LinkClient(scope, { SettingsStore.settings.value }, { cursor?.authorize(it) }, {
+            val point = android.graphics.Point()
+            @Suppress("DEPRECATION")
+            getSystemService(android.view.WindowManager::class.java).defaultDisplay.getRealSize(point)
+            point.x to point.y
+        })
         client = link
         jobs += scope.launch {
             link.state.collect { st ->
+                if (st.status == LinkStatus.DISCONNECTED) cursor?.revoke()
                 _state.value = st
                 updateNotification(st)
             }
@@ -230,6 +240,8 @@ class LinkService : Service() {
     }
 
     override fun onDestroy() {
+        cursor?.close()
+        cursor = null
         Log.i(TAG, "service destroyed")
         mainHandler.removeCallbacksAndMessages(null)
         activeService = null

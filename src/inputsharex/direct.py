@@ -52,34 +52,48 @@ def make_credentials(host: str):
 
 
 class DirectControlRelay:
-    def __init__(self, adb: Adb, serial: str, jar_path: str):
+    def __init__(self, adb: Adb, serial: str, jar_path: str, *, absolute_mouse=False, cursor_setup=None, direct=True):
         self.adb, self.serial, self.jar_path = adb, serial, jar_path
+        self.absolute_mouse = absolute_mouse
+        self.cursor_setup = cursor_setup
+        self.direct = direct
+        self.forward_port = None
         self.proc = None
         self.sock = None
         self.remote_pid = None
 
     def start(self):
-        host = str(ipaddress.ip_address(self.serial.rsplit(":", 1)[0].strip("[]")))
+        host = str(ipaddress.ip_address(self.serial.rsplit(":", 1)[0].strip("[]"))) if self.direct else "127.0.0.1"
         if not Path(self.jar_path).is_file():
             raise FileNotFoundError("Encrypted control relay is not bundled")
         context, bundle, password = make_credentials(host)
         token = secrets.token_hex(32)
+        if self.absolute_mouse:
+            if self.cursor_setup is None:
+                raise RuntimeError("Absolute cursor requires Android companion connection")
+            self.cursor_setup(token)
         remote = "/data/local/tmp/inputsharex-tls-relay.jar"
         self.adb.push(self.jar_path, remote)
         self.proc = subprocess.Popen(
             self.adb._base() + ["-s", self.serial, "shell", "-T",
-                f"CLASSPATH={remote} app_process / InputShareXRelay {host}"],
+                f"CLASSPATH={remote} app_process / InputShareXRelay {host}{' absolute' if self.absolute_mouse else ''}"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=adb_env(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         ready = queue.Queue()
+        self.output = []
 
         def read_output():
+            announced = False
             for line in self.proc.stdout:
-                if line.startswith(b"READY "):
+                if line.startswith(b"READY ") and not announced:
                     ready.put(line.decode().split())
-                    return
-            ready.put(None)
+                    announced = True
+                else:
+                    self.output.append(line.decode("utf-8", "replace").strip())
+                    self.output[:] = self.output[-20:]
+            if not announced:
+                ready.put(None)
 
         threading.Thread(target=read_output, name="relay-startup", daemon=True).start()
         self.proc.stdin.write(base64.b64encode(bundle) + b"\n" + password.encode() + b"\n" + token.encode() + b"\n")
@@ -91,13 +105,20 @@ class DirectControlRelay:
         if not result or len(result) != 3:
             raise RuntimeError("Encrypted relay did not start")
         port, self.remote_pid = int(result[1]), int(result[2])
+        if not self.direct:
+            result = self.adb.run_for(self.serial, "forward", "tcp:0", f"tcp:{port}")
+            self.forward_port = int(result.stdout.strip())
+            port = self.forward_port
         raw = socket.create_connection((host, port), timeout=4)
         try:
             raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.sock = context.wrap_socket(raw, server_hostname=host)
             self.sock.sendall(token.encode())
-            if self.sock.recv(1) != b"\0":
-                raise RuntimeError("Encrypted control handshake failed")
+            handshake = self.sock.recv(1)
+            if handshake != b"\0":
+                import time
+                time.sleep(0.1)
+                raise RuntimeError("Encrypted control handshake failed: " + " | ".join(self.output))
             self.sock.settimeout(None)
             return self.sock
         except BaseException:
@@ -107,6 +128,12 @@ class DirectControlRelay:
             raise
 
     def stop(self):
+        if self.forward_port is not None:
+            try:
+                self.adb.remove_forward(self.forward_port)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            self.forward_port = None
         if self.sock is not None:
             try:
                 self.sock.close()

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inputsharex"
-version = "0.4.13"
-description = "Windows 鼠标/键盘共享到 Android（无线 ADB + scrcpy UHID），带无线链路保活"
+version = "0.5.4"
+description = "Windows 鼠标/键盘共享到 Android（加密直连与 ADB），支持绝对坐标跨屏与触摸手势"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Unlicense" }

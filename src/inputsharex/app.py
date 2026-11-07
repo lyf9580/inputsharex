@@ -46,6 +46,8 @@ DEFAULT_CONFIG = {
     "serial": "",
     "keepalive_ms": 8,
     "cadence_ms": 4,
+    "mouse_speed": 3.75,
+    "cursor_scale": 1.5,
     "edge_switch": True,
     "edge_zone": 6,
     "edge_on_extended": False,
@@ -129,11 +131,8 @@ class AppController(QObject):
         # Last known Android cursor position (x, y, max_x, max_y) from an
         # edge-return event.  Reused to predict the entry landing point
         # without waiting for a slow remote position dump.
-        self._last_android_pos: tuple[float, float, float, float] | None = None
-        self._align_rate = 2.0
 
         # 共享期间临时打开“物理键盘也显示软键盘”，结束/退出时恢复用户原设置。
-        self._ime_hard_kb_old: str | None = None
         self._stop = False
         self._sharing = False
         self._sharing_thread = None
@@ -198,6 +197,12 @@ class AppController(QObject):
                 self.start_sharing()
         elif msg.get("type") == "sharing_request" and isinstance(msg.get("enabled"), bool):
             self.start_sharing() if msg["enabled"] else self.stop_sharing()
+        elif msg.get("type") == "display":
+            width, height = msg.get("width"), msg.get("height")
+            if type(width) is int and type(height) is int and 1 < width <= 65535 and 1 < height <= 65535:
+                self._screen_size = (width, height)
+                if self.session:
+                    self.session.set_screen_size(width, height)
         elif msg.get("type") == "config":
             self._apply_android_config(msg)
 
@@ -259,7 +264,6 @@ class AppController(QObject):
         if boundary:
             # 安卓端沿共享边的比例位置：横向相邻取 y，纵向相邻取 x；
             # 坐标已在探针里换算成当前旋转后的逻辑坐标，因此横竖屏都通用。
-            self._last_android_pos = (x, y, mx, my)
             if self.config.get("placement", 0) in (0, 1):
                 fraction = y / my
             else:
@@ -509,7 +513,7 @@ class AppController(QObject):
     def _ensure_android_app(self, serial: str) -> None:
         """连接后确认安卓端装有配套 App；缺了自动安装（失败不影响键鼠共享）。"""
         try:
-            ensure_android_app_installed(self.adb, serial, log=self._log)
+            ensure_android_app_installed(self.adb, serial, log=self._log, minimum_version="0.3.5")
         except Exception as exc:  # 自动安装是增强能力，不能拖垮连接流程
             self._log(f"检查/安装安卓端 App 时出错：{exc}")
 
@@ -592,6 +596,9 @@ class AppController(QObject):
         self._sharing_thread.start()
 
     def _sharing_worker(self, start_armed: bool) -> None:
+        adb, serial = self.adb, self.serial
+        ime_previous = None
+        ime_write_attempted = False
         try:
             self._set_state("connecting", "启动服务端…")
             interval = max(self.config.get("keepalive_ms", 8), 0) / 1000
@@ -613,14 +620,15 @@ class AppController(QObject):
                     self._log(f"后台 Wi-Fi 锁设置失败：{exc}，继续共享")
             server = ScrcpyServer(self.adb, self.serial, local_port=self.local_port,
                                   jar_path=default_jar_path(),
-                                  direct=self._selected_transport == "tls")
+                                  direct=self._selected_transport == "tls", absolute_mouse=True,
+                                  cursor_setup=self._setup_absolute_cursor)
             self.server = server
             sock = server.start()
             if server.transport == "tls-direct":
                 self._log("无线控制已使用加密直连通道")
             elif server.direct_error:
                 self._log(f"加密直连暂不可用，已回退 ADB：{server.direct_error}")
-            session = ControlSession(sock, keepalive_interval=interval, cadence_ms=cadence)
+            session = ControlSession(sock, keepalive_interval=interval, cadence_ms=cadence, absolute_mouse=True)
             self.session = session
             self._clip_last = ""
             self._arrow_pressed.clear()
@@ -628,31 +636,28 @@ class AppController(QObject):
             if self._screen_size:
                 session.set_screen_size(*self._screen_size)
             session.on_clipboard = self._on_device_clipboard
+            session.set_pointer_speed(float(self.config.get("mouse_speed", 3.75)))
+            session.set_cursor_scale(float(self.config.get("cursor_scale", 1.5)))
             session.create_mouse("inputsharex")
             # 键盘设备不在共享开始时就创建：安卓把 UHID 键盘当成物理键盘，
             # 会隐藏自带软键盘。推迟到真正接管鼠标时再创建。
             session.start()
             # 共享期间允许“物理键盘 + 软键盘”并存，避免 UHID 键盘顶掉安卓自带输入法；
             # 结束共享时（_teardown_sharing）恢复原来的系统设置。
-            self._schedule_ime_with_hard_keyboard(True)
             if not self._sharing:
                 return
-            try:
-                self.pointer_monitor = PointerMonitor(self.adb, self.serial,
-                    str(Path(server.jar_path).with_name("inputsharex-relay.jar")), self.edgeConfirmed.emit,
-                    lambda: self._log("边缘返回验证已停止，可按 Ctrl+Alt+Q 返回") if self._sharing else None)
-                self.pointer_monitor.start()
-            except (AdbError, OSError, RuntimeError, subprocess.SubprocessError):
-                if self.pointer_monitor:
-                    self.pointer_monitor.stop()
-                    self.pointer_monitor = None
-                self._log("自动边缘返回暂不可用，可按 Ctrl+Alt+Q 返回")
-            self._log("UHID 鼠标已创建，保活 %dms，合并周期 %.0fms"
+            ime_previous = self._read_ime_setting(adb, serial)
+            if self._sharing and ime_previous is not None and ime_previous != "1":
+                ime_write_attempted = True
+                self._write_ime_setting(adb, serial, "1")
+            if not self._sharing:
+                return
+            self._log("绝对坐标鼠标已就绪，跨屏直接定位，保活 %dms，合并周期 %.0fms"
                       % (self.config.get("keepalive_ms", 8), cadence))
 
             mods, vk = HOTKEYS.get(self.config.get("hotkey", "ctrl+alt+q"), HOTKEYS["ctrl+alt+q"])
             capture = InputCapture(
-                on_move=lambda dx, dy, buttons: session.mouse_move(dx, dy, buttons),
+                on_move=self._forward_mouse_move,
                 on_button=lambda buttons: session.mouse_button(buttons),
                 on_wheel=lambda v, h: session.scroll(v, h),
                 on_key=self._on_key,
@@ -671,7 +676,7 @@ class AppController(QObject):
             capture.can_capture = lambda: (self._sharing and self.state == "sharing"
                 and self.session is session and not session.closed
                 and session._thread is not None and session._thread.is_alive()
-                and self.pointer_monitor is not None and self.pointer_monitor.available)
+                and session._screen_size is not None)
             capture.start()
             if not self._sharing:
                 return
@@ -689,7 +694,11 @@ class AppController(QObject):
             self._set_state("error", str(exc))
         finally:
             self._sharing = False
-            self._teardown_sharing()
+            try:
+                self._teardown_sharing()
+            finally:
+                if ime_write_attempted:
+                    self._write_ime_setting(adb, serial, ime_previous)
             if self.state not in ("error",):
                 self._set_state("connected" if self.serial else "idle")
 
@@ -723,54 +732,33 @@ class AppController(QObject):
                 pass
             self.server = None
         self._armed = False
-        self._schedule_ime_with_hard_keyboard(False)
 
     # -- 安卓软键盘 ------------------------------------------------
-    def _apply_ime_with_hard_keyboard(self, enable: bool) -> None:
-        """共享期间让安卓在“物理键盘已连接”时仍显示自带软键盘，结束后还原。
+    _IME_SETTING = "show_ime_with_hard_keyboard"
 
-        键盘流转用 UHID 键盘，安卓会把它当成外接物理键盘；系统默认在检测到
-        物理键盘时隐藏软输入法（show_ime_with_hard_keyboard=0），表现为接管
-        后平板自带的输入法键盘不再弹出。这里只在共享期间临时打开该设置，
-        共享结束/程序退出时恢复原值，避免永久改掉用户的系统设置。
-        """
-        adb, serial = self.adb, self.serial
-        if adb is None or not serial:
-            return
+    def _read_ime_setting(self, adb, serial) -> str | None:
         try:
-            if enable:
-                if self._ime_hard_kb_old is None:
-                    proc = adb.run_for(
-                        serial, "shell", "settings", "get", "secure",
-                        "show_ime_with_hard_keyboard", check=False, timeout=6,
-                    )
-                    value = (proc.stdout or b"").decode("utf-8", "replace").strip()
-                    self._ime_hard_kb_old = value or "0"
-                adb.run_for(
-                    serial, "shell", "settings", "put", "secure",
-                    "show_ime_with_hard_keyboard", "1", check=False, timeout=6,
-                )
-            else:
-                old = self._ime_hard_kb_old
-                self._ime_hard_kb_old = None
-                if old is not None:
-                    adb.run_for(
-                        serial, "shell", "settings", "put", "secure",
-                        "show_ime_with_hard_keyboard", old, check=False, timeout=6,
-                    )
-        except Exception:
+            result = adb.run_for(serial, "shell", "settings", "get", "secure",
+                                 self._IME_SETTING, check=False, timeout=6)
+            if result.returncode == 0:
+                value = result.stdout.decode("utf-8", "replace").strip()
+                if value in ("null", "0", "1"):
+                    return value
+        except (AdbError, OSError, subprocess.SubprocessError):
             pass
+        self._log("读取安卓软键盘设置失败")
+        return None
 
-    def _schedule_ime_with_hard_keyboard(self, enable: bool) -> None:
+    def _write_ime_setting(self, adb, serial, value: str) -> None:
+        command = ("delete", "secure", self._IME_SETTING) if value == "null" else (
+            "put", "secure", self._IME_SETTING, value)
         try:
-            threading.Thread(
-                target=self._apply_ime_with_hard_keyboard,
-                args=(enable,),
-                name="ime-hard-keyboard",
-                daemon=True,
-            ).start()
-        except Exception:
+            result = adb.run_for(serial, "shell", "settings", *command, check=False, timeout=6)
+            if result.returncode == 0:
+                return
+        except (AdbError, OSError, subprocess.SubprocessError):
             pass
+        self._log("写入安卓软键盘设置失败")
 
     def stop_sharing(self) -> None:
         with self._sharing_lifecycle_lock:
@@ -785,10 +773,22 @@ class AppController(QObject):
     # -- 接管 ------------------------------------------------------
     def _on_arm_toggle(self, armed: bool) -> None:
         self._armed = armed
+        if self.session is not None and self.session.absolute_mouse:
+            if armed:
+                self.session.enter_pointer(self.config.get("placement", 0), self._enter_fraction)
+                self._enter_fraction = None
+                if self.capture:
+                    self.capture.finish_entry(self.capture.entry_ticket)
+            else:
+                self.session.leave_pointer()
         self._capture_generation = time.time_ns()
         _dbg_edge(f"arm-toggle armed={armed} gen={self._capture_generation} probe_available={getattr(self.pointer_monitor, 'available', None)}")
         if self.pointer_monitor:
-            self.pointer_monitor.set_enabled(armed, self._capture_generation, self.config.get("placement", 0))
+            self.pointer_monitor.set_interval(100)
+            self.pointer_monitor.set_enabled(
+                armed, self._capture_generation, self.config.get("placement", 0),
+                aligning=bool(armed and self.capture and self.capture.entry_ticket is not None),
+            )
         if not armed:
             self._arrow_pressed.clear()
         if not armed and self.session is not None:
@@ -805,16 +805,6 @@ class AppController(QObject):
                 self.session.create_keyboard("inputsharex")
             except Exception:
                 pass
-        if armed:
-            fraction = self._enter_fraction
-            self._enter_fraction = None
-            if fraction is not None:
-                threading.Thread(
-                    target=self._verify_entry_alignment,
-                    args=(fraction,),
-                    name="align-verify",
-                    daemon=True,
-                ).start()
         self._publish_sharing_state()
         if armed:
             self._log("鼠标已切换到安卓端（移动回原侧边缘可切回）")
@@ -833,135 +823,22 @@ class AppController(QObject):
             return
         self._enter_fraction = max(0.0, min(1.0, value))
         _dbg_edge(f"edge-enter edge={edge} fraction={self._enter_fraction}")
-        try:
-            self._pre_align_parallel(self._enter_fraction)
-        except Exception:
-            pass
 
-    def _glide_parallel(self, axis: int, units: int) -> None:
-        """Send a relative move in small chunks so acceleration stays linear."""
+    def _setup_absolute_cursor(self, token: str) -> None:
+        link = self.device_link
+        if link is None or not link.connected:
+            raise RuntimeError("请先连接安卓端 App，绝对坐标鼠标需要悬浮窗权限")
+        link.send({"type": "cursor_setup", "token": token})
+
+    def _forward_mouse_move(self, dx: int, dy: int, buttons: int) -> None:
         session = self.session
-        if session is None:
+        if session is None or session.closed:
             return
-        chunk = 40
-        try:
-            while units:
-                step = max(-chunk, min(chunk, units))
-                if axis == 1:
-                    session.mouse_move(0, step)
-                else:
-                    session.mouse_move(step, 0)
-                units -= step
-                time.sleep(0.012)
-        except Exception:
-            return
-
-    def _pre_align_parallel(self, fraction: float) -> None:
-        """Glide toward the landing point before the capture becomes visible.
-
-        The Android side only accepts relative reports, so the landing can
-        never be as instant as the local Windows return; chunked moves keep
-        the pointer acceleration predictable and avoid visible overshoot.
-        """
-        session = self.session
-        monitor = self.pointer_monitor
-        if session is None or monitor is None or session.closed or not self._sharing:
-            return
-        last = self._last_android_pos
-        if last is None:
-            _dbg_edge("entry-target no-cache")
-            return
-        px, py, max_x, max_y = last
-        edge = int(self.config.get("placement", 0))
-        tx, ty = entry_target(edge, fraction, max_x, max_y)
-        if edge in (0, 1):
-            cur, target, axis = py, ty, 1
-        else:
-            cur, target, axis = px, tx, 0
-        remaining = target - cur
-        _dbg_edge(
-            "entry-target cached=(%.1f,%.1f) target=(%.1f,%.1f) remaining=%.1f"
-            % (px, py, tx, ty, remaining)
-        )
-        if abs(remaining) <= 12:
-            return
-        # Deliberately no movement before the capture arms: a wrong prediction
-        # is visible as a jump.  The post-arm verify thread glides instead.
-
-    def _verify_entry_alignment(self, fraction: float) -> None:
-        """Correct the landing after capture; measured, low-gain steps."""
-        session = self.session
-        monitor = self.pointer_monitor
-        if session is None or monitor is None:
-            return
-        edge = int(self.config.get("placement", 0))
-        units_before = getattr(self.capture, "user_move_units", 0)
-        try:
-            if edge in (0, 1):
-                session.mouse_move(0, 1)
-                time.sleep(0.05)
-                session.mouse_move(0, -1)
-            else:
-                session.mouse_move(1, 0)
-                time.sleep(0.05)
-                session.mouse_move(-1, 0)
-        except Exception:
-            pass
-        deadline = time.monotonic() + 2.0
-        pos = None
-        while time.monotonic() < deadline:
-            pos = monitor.latest_position(0.5)
-            if pos is not None:
-                break
-            time.sleep(0.03)
-        if pos is None:
-            _dbg_edge("align-verify no-position")
-            return
-        for attempt in range(6):
-            if not self._armed or self._sharing is not True:
-                return
-            if getattr(self.capture, "user_move_units", 0) - units_before > 6:
-                _dbg_edge("align-verify user-moved")
-                return
-            px, py, max_x, max_y = pos
-            tx, ty = entry_target(edge, fraction, max_x, max_y)
-            if edge in (0, 1):
-                cur, target, axis = py, ty, 1
-            else:
-                cur, target, axis = px, tx, 0
-            error = target - cur
-            _dbg_edge(
-                "align-verify attempt=%d error=%.1f rate=%.2f"
-                % (attempt, error, self._align_rate)
-            )
-            if abs(error) <= 12:
-                return
-            units = int(round(error / max(self._align_rate, 0.5) * 0.85))
-            units = max(-120, min(120, units))
-            self._glide_parallel(axis, units)
-            sent_at = time.monotonic()
-            new_pos = None
-            while time.monotonic() - sent_at < 0.6:
-                candidate = monitor.latest_position(0.5)
-                if candidate is not None and monitor.position_at >= sent_at:
-                    new_pos = candidate
-                    break
-                time.sleep(0.02)
-            if new_pos is None:
-                _dbg_edge("align-verify no-feedback")
-                return
-            npx, npy, _, _ = new_pos
-            new_cur = npy if axis == 1 else npx
-            moved = new_cur - cur
-            if abs(units) > 0 and abs(moved) >= 2:
-                observed = abs(moved) / float(abs(units))
-                if 0.2 <= observed <= 400.0:
-                    self._align_rate = max(0.2, min(400.0, observed))
-            _dbg_edge(
-                "align-verify moved=%.1f units=%d rate=%.2f"
-                % (moved, units, self._align_rate)
-            )
-            pos = new_pos
+        session.mouse_move(dx, dy, buttons)
+        if self.config.get("edge_switch", True) and self.capture and self.capture.armed:
+            fraction = session.return_fraction(self.config.get("placement", 0), dx, dy)
+            if fraction is not None:
+                self.capture.return_from_device(fraction)
 
     def _on_key(self, vk: int, scan: int, extended: bool, up: bool) -> None:
         """接管期间把 PC 键盘事件转发到安卓（由低级键盘钩子回调）。"""
@@ -1219,6 +1096,17 @@ class AppController(QObject):
 
     # -- 配置 ------------------------------------------------------
     def update_config(self, **changes) -> None:
+        for key, low, high in (("mouse_speed", 0.25, 6.0), ("cursor_scale", 1.0, 4.0)):
+            if key in changes:
+                number = float(changes[key])
+                if not math.isfinite(number) or not low <= number <= high:
+                    raise ValueError(f"{key} must be between {low} and {high}")
+                changes[key] = number
+        if self.session is not None:
+            if "mouse_speed" in changes:
+                self.session.set_pointer_speed(changes["mouse_speed"])
+            if "cursor_scale" in changes:
+                self.session.set_cursor_scale(changes["cursor_scale"])
         self.config.update(changes)
         save_config(self.config)
         if self.capture is not None:
@@ -1240,9 +1128,9 @@ class AppController(QObject):
         self._stop_qr_watch()
         self.stop_sharing()
         if self._sharing_thread:
-            self._sharing_thread.join(timeout=6)
-        # 退出前确保把 show_ime_with_hard_keyboard 还原（异步恢复线程可能来不及跑）。
-        self._apply_ime_with_hard_keyboard(False)
+            self._sharing_thread.join(timeout=15)
+            if self._sharing_thread.is_alive():
+                self._log("等待共享清理超时，安卓软键盘设置可能未恢复")
         if self.device_link is not None:
             self.device_link.stop()
         time.sleep(0.2)

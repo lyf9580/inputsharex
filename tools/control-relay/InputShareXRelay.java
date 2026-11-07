@@ -43,7 +43,8 @@ public final class InputShareXRelay {
                     listener.close();
                     // Keepalive reports maintain active connections; failed peers expire.
                     tcp.setSoTimeout(30000);
-                    try (LocalSocket local = new LocalSocket()) {
+                    try (InputShareXAbsoluteMouse mouse = args.length > 1 && args[1].equals("absolute") ? new InputShareXAbsoluteMouse(token) : null;
+                         LocalSocket local = new LocalSocket()) {
                         local.connect(new LocalSocketAddress("scrcpy", LocalSocketAddress.Namespace.ABSTRACT));
                         Thread reverse = new Thread(() -> {
                             try { copy(local.getInputStream(), tcp.getOutputStream()); }
@@ -52,10 +53,12 @@ public final class InputShareXRelay {
                         }, "relay-replies");
                         reverse.setDaemon(true);
                         reverse.start();
-                        copy(tcp.getInputStream(), local.getOutputStream());
+                        if (mouse == null) copy(tcp.getInputStream(), local.getOutputStream());
+                        else InputShareXAbsoluteMouse.forward(tcp.getInputStream(), local.getOutputStream(), mouse);
                     }
                     return;
                 } catch (IOException failure) {
+                    failure.printStackTrace(System.err);
                     if (listener.isClosed()) return;
                     System.err.println("Relay connection rejected: " + failure.getClass().getSimpleName());
                 }

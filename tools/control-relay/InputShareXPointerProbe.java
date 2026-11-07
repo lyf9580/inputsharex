@@ -13,7 +13,7 @@ public final class InputShareXPointerProbe {
     private static volatile boolean running = true;
     private static volatile String command = "0";
     private static volatile int dumpIntervalMs = 100;
-    private static final Pattern DEVICE_STATE = Pattern.compile("(?:DeviceId\\()?(\\d+)\\)?:\\[");
+    private static final Pattern DEVICE_STATE = Pattern.compile("(?:DeviceId\\()?(-?\\d+)\\)?:\\[");
     private static final Pattern POINT = Pattern.compile("hoveringPointers=\\[Pointer\\(id=\\d+, MOUSE\\) at \\(([-0-9.]+), ([-0-9.]+)\\)");
     // InputDispatcher 里的鼠标坐标是“未旋转的物理/自然坐标”，而窗口/显示已经按 ROTATION_* 旋转；
     // 直接拿它和放置方向比较，设备一转屏（横竖切换）边缘就判断错了。这里从同一份 dump 中解析
@@ -64,7 +64,8 @@ public final class InputShareXPointerProbe {
             }
             if (current.startsWith("1 ") && !sent) {
                 String[] parts = current.split(" ");
-                if (parts.length == 3) {
+                if (parts.length == 3 || (parts.length == 4 && parts[3].equals("align"))) {
+                    boolean aligning = parts.length == 4;
                     int edge = Integer.parseInt(parts[2]);
                     InputDevice mouse = null;
                     for (int id : InputDevice.getDeviceIds()) {
@@ -95,7 +96,7 @@ public final class InputShareXPointerProbe {
                                 boolean boundary = edge == 0 ? x <= 0.5f : edge == 1 ? x >= maxX - 0.5f
                                     : edge == 2 ? y <= 0.5f : y >= maxY - 0.5f;
                                 if (!boundary) interiorSeen = true;
-                                if (boundary && interiorSeen) {
+                                if (boundary && interiorSeen && !aligning) {
                                     System.out.println("EDGE " + parts[1] + " " + edge + " " + x + " " + y + " " + maxX + " " + maxY);
                                     System.out.flush();
                                     sent = true;
@@ -152,36 +153,23 @@ public final class InputShareXPointerProbe {
     }
 
     private static float[] findPoint(String dump, int id) {
-        String[] lines = dump.split("\n");
-        for (int i = 0; i < lines.length; i++) {
-            int at = lines[i].indexOf("mDeviceStates=");
-            if (at < 0) continue;
-            // Android 12–16: mDeviceStates=296:[...]
-            // Android 17:    mDeviceStates=
-            //                  DeviceId(15):[...]
-            StringBuilder block = new StringBuilder(lines[i].substring(at + "mDeviceStates=".length()));
-            int j = i + 1;
-            while (block.indexOf("[") < 0 && j < lines.length && j <= i + 2) {
-                block.append('\n').append(lines[j].trim());
-                j++;
-            }
-            Matcher state = DEVICE_STATE.matcher(block);
-            int regionStart = 0, lastId = -1, lastEnd = 0;
-            while (true) {
-                state.region(regionStart, block.length());
-                if (!state.find()) break;
-                if (lastId == id) {
-                    Matcher point = POINT.matcher(block.substring(lastEnd, state.start()));
-                    if (point.find()) return new float[]{Float.parseFloat(point.group(1)), Float.parseFloat(point.group(2))};
-                }
-                lastId = Integer.parseInt(state.group(1));
-                lastEnd = state.end();
-                regionStart = lastEnd;
-            }
+        // Device states can span several lines, including when injected input
+        // and the UHID mouse share the same window on Android 16.
+        Matcher state = DEVICE_STATE.matcher(dump);
+        int lastId = Integer.MIN_VALUE, lastEnd = 0;
+        while (state.find()) {
             if (lastId == id) {
-                Matcher point = POINT.matcher(block.substring(lastEnd));
-                if (point.find()) return new float[]{Float.parseFloat(point.group(1)), Float.parseFloat(point.group(2))};
+                Matcher point = POINT.matcher(dump.substring(lastEnd, state.start()));
+                if (point.find()) {
+                    return new float[]{Float.parseFloat(point.group(1)), Float.parseFloat(point.group(2))};
+                }
             }
+            lastId = Integer.parseInt(state.group(1));
+            lastEnd = state.end();
+        }
+        if (lastId == id) {
+            Matcher point = POINT.matcher(dump.substring(lastEnd));
+            if (point.find()) return new float[]{Float.parseFloat(point.group(1)), Float.parseFloat(point.group(2))};
         }
         return null;
     }

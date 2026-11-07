@@ -164,3 +164,12 @@ EMPTY_MESSAGES = {
 
 def empty(name: str) -> bytes:
     return _u8(EMPTY_MESSAGES[name])
+
+
+# Length-framed extension consumed by InputShareXRelay, never passed to scrcpy.
+ABS_ENTER, ABS_MOVE, ABS_BUTTONS, ABS_SCROLL, ABS_LEAVE, ABS_KEEPALIVE, ABS_CONFIG = range(7)
+
+def absolute_mouse(action: int, buttons: int, x: int, y: int, width: int, height: int,
+                   horizontal: float = 0, vertical: float = 0) -> bytes:
+    return struct.pack(">BBIiiHHff", 18, action, buttons & 31, x, y, width, height,
+                       horizontal, vertical)

@@ -29,8 +29,7 @@ class PointerMonitor:
         self.desired = "0\n"
         self.available = False
         self.diagnostic = []
-        self.position = None
-        self.position_at = 0.0
+        self._position_sample = None
 
     def start(self):
         remote = "/data/local/tmp/inputsharex-pointer.jar"
@@ -55,10 +54,9 @@ class PointerMonitor:
                     _dbg(f"READY pid={self.pid}")
                     self._write()
                 elif len(parts) == 7 and parts[0] == "POSITION":
-                    import time as _time
-                    self.position = (float(parts[3]), float(parts[4]),
-                                     float(parts[5]), float(parts[6]))
-                    self.position_at = _time.monotonic()
+                    self._position_sample = (
+                        int(parts[1]), time.monotonic(), tuple(map(float, parts[3:])),
+                    )
                     _dbg('POSITION ' + ' '.join(parts[1:]))
                 elif len(parts) == 7 and parts[0] == "EDGE":
                     _dbg("EDGE " + " ".join(parts[1:]))
@@ -71,7 +69,7 @@ class PointerMonitor:
             pass
         finally:
             self.available = False
-            self.position = None
+            self._position_sample = None
             if self.on_error:
                 self.on_error()
 
@@ -84,17 +82,18 @@ class PointerMonitor:
                 except (OSError, ValueError):
                     pass
 
-    def latest_position(self, max_age: float = 1.0):
-        pos = self.position
-        if pos is None:
+    def latest_position(self, max_age: float = 1.0, *, generation: int, since: float = 0):
+        sample = self._position_sample
+        if sample is None:
             return None
-        import time as _time
-        if _time.monotonic() - self.position_at > max_age:
+        sample_generation, timestamp, pos = sample
+        if sample_generation != generation or timestamp < since or time.monotonic() - timestamp > max_age:
             return None
         return pos
 
-    def set_enabled(self, enabled, generation, placement):
-        self.desired = f"1 {int(generation)} {int(placement)}\n" if enabled else "0\n"
+    def set_enabled(self, enabled, generation, placement, *, aligning=False):
+        mode = " align" if aligning else ""
+        self.desired = f"1 {int(generation)} {int(placement)}{mode}\n" if enabled else "0\n"
         _dbg(f"set_enabled desired={self.desired.strip()} available={self.available} pid={self.pid}")
         self._write()
 

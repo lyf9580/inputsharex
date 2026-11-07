@@ -51,6 +51,8 @@ data class LinkState(
 class LinkClient(
     private val scope: CoroutineScope,
     private val settingsProvider: () -> Settings,
+    private val cursorSetup: (String) -> Unit = {},
+    private val displaySize: () -> Pair<Int, Int> = { 0 to 0 },
 ) {
     companion object {
         private const val TAG = "LinkClient"
@@ -123,6 +125,7 @@ class LinkClient(
         writer = out
 
         sendFrame(Frames.hello(Build.MODEL ?: "Android", Build.VERSION.SDK_INT, settingsProvider().autoShare))
+        pushDisplay()
         val settings = settingsProvider()
         sendFrame(Frames.config(settings.edge.ordinal xor 1, settings.keepAwake, settings.lockRefresh, settings.autoShare))
 
@@ -141,6 +144,7 @@ class LinkClient(
             var last = rxBytes.get()
             while (isActive && socket === s) {
                 delay(1000)
+                pushDisplay()
                 val now = rxBytes.get()
                 _state.update { it.copy(bytesPerSec = (now - last).toInt().coerceAtLeast(0)) }
                 last = now
@@ -166,6 +170,7 @@ class LinkClient(
             return
         }
         when (obj.optString("type")) {
+            "cursor_setup" -> cursorSetup(obj.optString("token"))
             "welcome" -> _state.update { it.copy(
                 desktopName = obj.optString("desktop", ""),
                 desktopVersion = obj.optInt("version", 0),
@@ -200,6 +205,18 @@ class LinkClient(
             ) }
             else -> Unit
         }
+    }
+
+    fun reportCursor(x: Int, y: Int, width: Int, height: Int) {
+        scope.launch(Dispatchers.IO) {
+            sendFrame(JSONObject().put("type", "cursor_position").put("x", x).put("y", y)
+                .put("width", width).put("height", height).toString())
+        }
+    }
+
+    private fun pushDisplay() {
+        val (w, h) = displaySize()
+        sendFrame(JSONObject().put("type", "display").put("width", w).put("height", h).toString())
     }
 
     private fun sendFrame(frame: String) {

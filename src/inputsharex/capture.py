@@ -349,8 +349,9 @@ class InputCapture:
         self.on_button = on_button or (lambda buttons: None)
         self.on_wheel = on_wheel or (lambda v, h: None)
         self.on_toggle = on_toggle or (lambda armed: None)
-        self.user_move_seq = 0
-        self.user_move_units = 0
+        self._entry_lock = threading.RLock()
+        self.entry_ticket = None
+        self._entry_dx = self._entry_dy = 0
         self.on_edge = on_edge or (lambda edge, entered: None)
         self.on_enter = on_enter or (lambda edge, fraction: None)
         self.on_key = on_key or (lambda vk, scan, extended, up: None)
@@ -555,6 +556,15 @@ class InputCapture:
         flags = raw.mouse.usButtonFlags
         data = raw.mouse.usButtonData
 
+        with self._entry_lock:
+            if self.armed and self.entry_ticket is not None:
+                if flags:
+                    self.finish_entry(self.entry_ticket)
+                else:
+                    self._entry_dx += raw.mouse.lLastX
+                    self._entry_dy += raw.mouse.lLastY
+                    return
+
         if flags & RI_MOUSE_LEFT_BUTTON_DOWN:
             self.buttons |= BTN_LEFT
         if flags & RI_MOUSE_LEFT_BUTTON_UP:
@@ -577,10 +587,6 @@ class InputCapture:
             self.buttons &= ~BTN_EXTRA
 
         dx, dy = raw.mouse.lLastX, raw.mouse.lLastY
-        if dx or dy:
-            self.user_move_seq += 1
-            self.user_move_units += abs(dx) + abs(dy)
-
         if not self.armed:
             if self.edge_switch and (dx or dy):
                 self._check_edge_trigger(dx, dy)
@@ -599,12 +605,26 @@ class InputCapture:
         self.on_button(self.buttons)
         if dx or dy:
             self.on_move(dx, dy, self.buttons)
+            # The move callback may synchronously return to the PC at its mapped position.
+            if not self.armed:
+                return
             self._warp()
             # 边缘切换与手动接管都支持「反向推回原侧边缘」返回电脑
             self._acc_x += dx
             self._acc_y += dy
 
     # -- 边缘切换（按光标所在显示器判定）----------------------------
+    def finish_entry(self, ticket) -> None:
+        """Replay crossing input once, after positioning or an explicit cancellation."""
+        with self._entry_lock:
+            if ticket is None or self.entry_ticket is not ticket:
+                return
+            self.entry_ticket = None
+            dx, dy = self._entry_dx, self._entry_dy
+            self._entry_dx = self._entry_dy = 0
+            if self.armed and (dx or dy):
+                self.on_move(dx, dy, self.buttons)
+
     def _check_edge_trigger(self, dx: int, dy: int,
                             pos: tuple[int, int] | None = None) -> None:
         if pos is None:
@@ -710,6 +730,9 @@ class InputCapture:
         self.armed = True
         self._kb_mods = 0
         if edge_mode:
+            with self._entry_lock:
+                self.entry_ticket = object()
+                self._entry_dx = self._entry_dy = 0
             self.on_enter(self.edge, edge_fraction(self.edge, (x, y)))
         else:
             self.on_enter(self.edge, None)
@@ -747,6 +770,9 @@ class InputCapture:
             return
         _dbg(f"leave-armed pos={pos} edge_mode={self.edge_mode}")
         self.armed = False
+        with self._entry_lock:
+            self.entry_ticket = None
+            self._entry_dx = self._entry_dy = 0
         self.edge_mode = False
         self._kb_mods = 0
         user32.ClipCursor(None)

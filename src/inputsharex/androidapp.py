@@ -102,7 +102,7 @@ def launch(adb: Adb, serial: str, *, log=None) -> bool:
 
 
 def ensure_installed(adb: Adb, serial: str, *, apk_path: str | None = None,
-                     log=None, open_app: bool = True) -> bool:
+                     log=None, open_app: bool = True, minimum_version: str | None = None) -> bool:
     """确保安卓端装有配套 App；缺了就从打包 APK 自动安装。
 
     Returns:
@@ -113,7 +113,7 @@ def ensure_installed(adb: Adb, serial: str, *, apk_path: str | None = None,
             log(message)
 
     installed, version = installed_version(adb, serial)
-    if installed:
+    if installed and (minimum_version is None or tuple(int(v) for v in re.findall(r"\d+", version)) >= tuple(int(v) for v in minimum_version.split("."))):
         say(_describe(installed, version))
         return True
 
@@ -126,7 +126,8 @@ def ensure_installed(adb: Adb, serial: str, *, apk_path: str | None = None,
         say(f"未检测到安卓端 App，自动安装包不存在：{path}")
         return False
 
-    say(f"未检测到安卓端 App，正在自动安装（{os.path.basename(path)}）…")
+    say((f"安卓端 {version or '未知版本'} 需要升级至 {minimum_version}，正在更新" if installed
+         else "未检测到安卓端 App，正在自动安装") + f"（{os.path.basename(path)}）…")
     try:
         proc = adb.run_for(serial, "install", "-r", path, check=False, timeout=240)
     except (AdbError, OSError, subprocess.SubprocessError) as exc:
@@ -140,7 +141,7 @@ def ensure_installed(adb: Adb, serial: str, *, apk_path: str | None = None,
         return False
 
     installed, version = installed_version(adb, serial)
-    if not installed:
+    if not installed or (minimum_version is not None and tuple(int(v) for v in re.findall(r"\d+", version)) < tuple(int(v) for v in minimum_version.split("."))):
         say("已执行安装，但未能确认安卓端 App 安装成功；请在设备上核对")
         return False
     say(f"已自动安装安卓端 App（{version}）" if version else "已自动安装安卓端 App")

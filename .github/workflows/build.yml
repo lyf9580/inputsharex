@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   android:
@@ -45,18 +45,77 @@ jobs:
           grep distributionUrl gradle/wrapper/gradle-wrapper.properties
           grep -c aliyun settings.gradle.kts || true
 
-      - name: Build debug APK
+      - name: Build Android APK
         shell: bash
         working-directory: android
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ startsWith(github.ref, 'refs/tags/') && secrets.ANDROID_RELEASE_KEYSTORE_BASE64 || '' }}
+          ANDROID_RELEASE_STORE_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/') && secrets.ANDROID_RELEASE_STORE_PASSWORD || '' }}
+          ANDROID_RELEASE_KEY_ALIAS: ${{ startsWith(github.ref, 'refs/tags/') && secrets.ANDROID_RELEASE_KEY_ALIAS || '' }}
+          ANDROID_RELEASE_KEY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/') && secrets.ANDROID_RELEASE_KEY_PASSWORD || '' }}
         run: |
+          set -euo pipefail
           chmod +x gradlew
-          timeout 1200 ./gradlew :app:assembleDebug --console=plain --no-daemon --stacktrace
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            for name in RELEASE_KEYSTORE_BASE64 ANDROID_RELEASE_STORE_PASSWORD ANDROID_RELEASE_KEY_ALIAS ANDROID_RELEASE_KEY_PASSWORD; do
+              if [[ -z "${!name}" ]]; then
+                echo "::error::Missing Android release signing secret: $name"
+                exit 1
+              fi
+            done
+            umask 077
+            export ANDROID_RELEASE_KEYSTORE="$(mktemp "$RUNNER_TEMP/inputsharex-signing.XXXXXX")"
+            trap 'rm -f "$ANDROID_RELEASE_KEYSTORE"' EXIT
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_RELEASE_KEYSTORE"
+            fingerprint="$(keytool -exportcert -keystore "$ANDROID_RELEASE_KEYSTORE" \
+              -storepass:env ANDROID_RELEASE_STORE_PASSWORD -alias "$ANDROID_RELEASE_KEY_ALIAS" \
+              | sha256sum | cut -d ' ' -f 1)"
+            if [[ "$fingerprint" == 9305aa72ed4b3cf87039607b9b1b6778dafe5740f00de0cfa10da064772961b3 ]]; then
+              echo "::error::The old public Android signing key cannot be used for releases."
+              exit 1
+            fi
+            timeout 1200 ./gradlew :app:assembleRelease --console=plain --no-daemon --stacktrace
+            cp app/build/outputs/apk/release/app-release.apk inputsharex-android.apk
+          else
+            timeout 1200 ./gradlew :app:assembleDebug --console=plain --no-daemon --stacktrace
+            cp app/build/outputs/apk/debug/app-debug.apk inputsharex-android.apk
+          fi
+
+      - name: Build Android control relay from source
+        shell: bash
+        run: |
+          set -euo pipefail
+          classes="$RUNNER_TEMP/control-relay/classes"
+          dex="$RUNNER_TEMP/control-relay/dex"
+          android_jar="$ANDROID_HOME/platforms/android-35/android.jar"
+          mkdir -p "$classes" "$dex"
+          javac -source 8 -target 8 -cp "$android_jar" -d "$classes" tools/control-relay/*.java
+          "$ANDROID_HOME/build-tools/35.0.0/d8" --lib "$android_jar" --min-api 26 --output "$dex" "$classes"/*.class
+          jar cf vendor/inputsharex-relay.jar -C "$dex" classes.dex
+
+      - name: Upload control relay artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: control-relay
+          path: vendor/inputsharex-relay.jar
+          if-no-files-found: error
+
+      - name: Test pointer dump parsing
+        shell: bash
+        run: |
+          set -euo pipefail
+          classes="$RUNNER_TEMP/pointer-tests"
+          android_jar="$ANDROID_HOME/platforms/android-35/android.jar"
+          mkdir -p "$classes"
+          javac -cp "$android_jar" -d "$classes" tools/control-relay/InputShareXPointerProbe.java tools/control-relay/tests/PointerParserTest.java tools/control-relay/InputShareXTouchScroll.java tools/control-relay/tests/TouchScrollTest.java
+          java -cp "$classes:$android_jar" PointerParserTest
+          java -cp "$classes:$android_jar" TouchScrollTest
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: android/inputsharex-android.apk
           if-no-files-found: error
 
   windows:
@@ -83,9 +142,15 @@ jobs:
           name: android-apk
           path: android-apk
 
+      - name: Download compiled control relay
+        uses: actions/download-artifact@v4
+        with:
+          name: control-relay
+          path: vendor
+
       - name: Bundle APK into vendor
         shell: bash
-        run: cp android-apk/app-debug.apk vendor/inputsharex-android.apk
+        run: cp android-apk/inputsharex-android.apk vendor/inputsharex-android.apk
 
       - name: Run Python tests
         shell: bash
@@ -98,6 +163,7 @@ jobs:
           files = (
               "protocol", "wifi", "session", "direct", "devices", "pairing",
               "androidapp", "keyboard", "clipboard", "qr_flow", "update",
+              "sharing", "imports", "absolute",
           )
           total = 0
           for name in files:
@@ -106,7 +172,7 @@ jobs:
               for test in tests:
                   test()
               total += len(tests)
-          print(total, "non-GUI tests passed")
+          print(total, "tests passed")
           PY
 
       - name: Build InputShareX.exe
@@ -124,10 +190,14 @@ jobs:
 
   release:
     name: Attach assets to release
+    permissions:
+      contents: write
     if: startsWith(github.ref, 'refs/tags/')
     needs: [android, windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download APK
         uses: actions/download-artifact@v4
         with:
@@ -143,12 +213,31 @@ jobs:
       - name: Rename APK with version
         shell: bash
         run: |
-          mv assets/app-debug.apk "assets/inputsharex-android-${{ needs.android.outputs.version }}.apk"
+          mv assets/inputsharex-android.apk "assets/inputsharex-android-${{ needs.android.outputs.version }}.apk"
+
+      - name: Prepare release notes and checksums
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          if [[ -f "docs/releases/$GITHUB_REF_NAME.md" ]]; then
+            cp "docs/releases/$GITHUB_REF_NAME.md" "$notes"
+          else
+            printf '## %s\n\n自动构建的 Windows 客户端与 Android 配套应用。\n' "$GITHUB_REF_NAME" > "$notes"
+          fi
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
+          (cd assets && sha256sum InputShareX.exe *.apk > SHA256SUMS.txt)
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
           files: |
+            assets/SHA256SUMS.txt
             assets/InputShareX.exe
             assets/inputsharex-android-${{ needs.android.outputs.version }}.apk
           fail_on_unmatched_files: true

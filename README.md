@@ -4,7 +4,7 @@
 
 安卓端看到的是一个**真实的 USB 鼠标（UHID）**，不是模拟触摸；**不走视频流**，只传控制数据，所以延迟和流量都远低于投屏方案，也不受屏幕分辨率影响。
 
-- 桌面端 **v0.4.10** · 安卓端 **v0.3.1**
+- 桌面端 **v0.4.11** · 安卓端 **v0.3.1**
 - 下载：[Releases](https://github.com/lyf9580/inputsharex/releases/latest)（Windows EXE + 安卓 APK）
 
 ![桌面端设备页](docs/screenshots/desktop-devices-v042.png)

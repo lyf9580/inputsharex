@@ -802,9 +802,9 @@ class AppController(QObject):
             fraction = self._enter_fraction
             self._enter_fraction = None
             threading.Thread(
-                target=self._align_pointer_to_shared_edge,
+                target=self._align_depth_after_arm,
                 args=(fraction,),
-                name="align-pointer",
+                name="align-depth",
                 daemon=True,
             ).start()
         self._publish_sharing_state()
@@ -825,175 +825,161 @@ class AppController(QObject):
             return
         self._enter_fraction = max(0.0, min(1.0, value))
         _dbg_edge(f"edge-enter edge={edge} fraction={self._enter_fraction}")
+        try:
+            self._pre_align_parallel(self._enter_fraction)
+        except Exception:
+            pass
 
-    def _align_pointer_to_shared_edge(self, fraction: float) -> None:
-        """进入安卓端后，只沿共享边方向把光标挪到对应等比位置。
+    def _pre_align_parallel(self, fraction: float) -> None:
+        """Align the cursor along the shared edge *before* the mouse is captured.
 
-        绝不移动垂直于边缘的深度轴：深度方向过冲撞边会误触发返回，
-        平行移动不会命中共享边，因此这里不抑制边缘事件，用户随时可回推。
+        Runs synchronously inside the edge-entry callback so the user sees the
+        Android cursor already at the proportional height on the very first
+        frame.  Only the parallel axis moves here: it can never trigger the
+        shared-edge return.  Hard-bounded to ~1s.
         """
+        session = self.session
+        monitor = self.pointer_monitor
+        if session is None or monitor is None or session.closed or not self._sharing:
+            return
+        edge = int(self.config.get("placement", 0))
+        try:
+            monitor.set_enabled(True, time.time_ns(), edge)
+        except Exception:
+            return
+        try:
+            if edge in (0, 1):
+                session.mouse_move(0, 1)
+                time.sleep(0.05)
+                session.mouse_move(0, -1)
+            else:
+                session.mouse_move(1, 0)
+                time.sleep(0.05)
+                session.mouse_move(-1, 0)
+            deadline = time.monotonic() + 1.0
+            pos = None
+            while time.monotonic() < deadline and pos is None:
+                pos = monitor.latest_position(0.4)
+                if pos is None:
+                    time.sleep(0.02)
+            if pos is None:
+                return
+            rate = 40.0
+            for _ in range(16):
+                if time.monotonic() > deadline or session.closed or not self._sharing:
+                    return
+                px, py, max_x, max_y = pos
+                tx, ty = entry_target(edge, fraction, max_x, max_y)
+                if edge in (0, 1):
+                    cur, target = py, ty
+                else:
+                    cur, target = px, tx
+                remaining = target - cur
+                if abs(remaining) <= 12:
+                    _dbg_edge("pre-align done remaining=%.1f" % remaining)
+                    return
+                req = int(round(remaining / rate))
+                req = max(-260, min(260, req))
+                if req == 0:
+                    req = 1 if remaining > 0 else -1
+                if abs(remaining) < 60:
+                    req = (1 if req > 0 else -1) * max(1, min(8, abs(req)))
+                if edge in (0, 1):
+                    session.mouse_move(0, req)
+                else:
+                    session.mouse_move(req, 0)
+                sent = time.monotonic()
+                nxt = None
+                while time.monotonic() - sent < 0.3:
+                    time.sleep(0.015)
+                    if monitor.position_at > sent:
+                        nxt = monitor.latest_position(0.4)
+                        break
+                if nxt is None:
+                    nxt = monitor.latest_position(0.4)
+                    if nxt is None:
+                        return
+                moved = (nxt[1] - py) if edge in (0, 1) else (nxt[0] - px)
+                if abs(moved) > 0.5:
+                    observed = moved / float(req)
+                    if 0.5 <= observed <= 300.0:
+                        rate = max(1.0, min(300.0, 0.55 * observed + 0.45 * rate))
+                _dbg_edge("pre-align cur=%.1f target=%.1f req=%d rate=%.2f"
+                          % (cur, target, req, rate))
+                pos = nxt
+        except Exception:
+            return
+
+    def _align_depth_after_arm(self, fraction: float) -> None:
+        """After capture arms, move the cursor just inside the shared edge."""
         session = self.session
         monitor = self.pointer_monitor
         if session is None or monitor is None:
             return
         edge = int(self.config.get("placement", 0))
-        _dbg_edge(f"align-start fraction={fraction} edge={edge} monitor={monitor is not None}")
-        time.sleep(0.2)  # 等进入瞬间的惯性移动发完
-        # 刚接管的 UHID 鼠标还没产生过事件时，Android 的输入 dump 里没有它的指针状态，
-        # 探针就报不出坐标。先沿共享边方向轻推一下再推回，激活设备状态（不影响深度轴）。
-        try:
-            if edge in (0, 1):
-                session.mouse_move(0, 1)
-                time.sleep(0.08)
-                session.mouse_move(0, -1)
-            else:
-                session.mouse_move(1, 0)
-                time.sleep(0.08)
-                session.mouse_move(-1, 0)
-        except Exception:
-            return
-        def current():
-            pos = monitor.latest_position(0.5)
-            if pos is None:
-                return None
-            px, py, max_x, max_y = pos
-            tx, ty = entry_target(edge, fraction, max_x, max_y)
-            axis_y = edge in (0, 1)
-            return axis_y, (py if axis_y else px), (ty if axis_y else tx)
-
-        def send(value: int) -> None:
-            # 平行于共享边：左右型边缘调 y，上下型边缘调 x。
-            if edge in (0, 1):
-                session.mouse_move(0, int(value))
-            else:
-                session.mouse_move(int(value), 0)
-
-        def send_depth(value: int) -> None:
-            # 垂直（深度）方向：左右型边缘调 x，上下型边缘调 y。
-            if edge in (0, 1):
-                session.mouse_move(int(value), 0)
-            else:
-                session.mouse_move(0, int(value))
-
-        deadline = time.monotonic() + 12.0
-        state = None
-        while time.monotonic() < deadline and state is None:
-            state = current()
-            if state is None:
-                time.sleep(0.05)
-        if state is None:
-            return
         capture = self.capture
-        start_move_seq = getattr(capture, "user_move_seq", 0) if capture is not None else 0
+        start_units = getattr(capture, "user_move_units", 0) if capture is not None else 0
 
         def user_moved() -> bool:
             if capture is None:
                 return False
-            return getattr(capture, "user_move_seq", start_move_seq) - start_move_seq > 12
-        # 安卓端对相对位移有明显加速，步长必须小、并以“移动后新上报的坐标”闭环，
-        # 只沿共享边方向走，所以即使略有过冲也绝不会撞到共享边触发返回。
-        rate = 2.0  # 安卓端相对位移的初始估计：每单位约 2 像素，随后按实测校正
-        while time.monotonic() < deadline:
-            if not self._armed or session.closed or not self._sharing:
-                return
-            if self.pointer_monitor is not monitor or user_moved():
-                return
-            cur, target = state[1], state[2]
-            remaining = target - cur
-            if abs(remaining) <= 10:
-                break
-            request = int(round(remaining / rate))
-            if request == 0:
-                request = 4 if remaining > 0 else -4
-            request = max(-40, min(40, request))
-            try:
-                send(request)
-            except Exception:
-                return
-            sent_at = time.monotonic()
-            nxt = None
-            while time.monotonic() - sent_at < 0.4:
-                time.sleep(0.03)
-                nxt = current()
-                if nxt is not None and monitor.position_at > sent_at:
-                    break
-                nxt = None
-            if nxt is None:
-                state = current()
-                if state is None:
+            return getattr(capture, "user_move_units", start_units) - start_units > 3
+
+        try:
+            time.sleep(0.05)
+            deadline = time.monotonic() + 1.4
+            rate = 40.0
+            for _ in range(10):
+                if time.monotonic() > deadline or not self._armed or session.closed or not self._sharing:
                     return
-                continue
-            moved = nxt[1] - cur
-            if abs(request) >= 4 and abs(moved) > 0.5:
-                observed = moved / float(request)
-                if 0.2 <= observed <= 8.0:
-                    rate = max(0.5, min(6.0, 0.5 * rate + 0.5 * observed))
-            _dbg_edge(
-                "align-step cur=%.1f target=%.1f remain=%.1f req=%d rate=%.2f"
-                % (cur, target, remaining, request, rate)
-            )
-            state = nxt
-
-        # 深度方向：把光标挪到共享边内侧（保留边距，避免撞边误触发返回）。
-        # 只在离边较远时做；接近边界时逐步减速、进入安全距离立即停止。
-        pos = monitor.latest_position(0.5)
-        if pos is None:
+                if self.pointer_monitor is not monitor or user_moved():
+                    return
+                pos = monitor.latest_position(0.4)
+                if pos is None:
+                    return
+                px, py, max_x, max_y = pos
+                if edge in (0, 1):
+                    depth, mx = px, max_x
+                else:
+                    depth, mx = py, max_y
+                target = 60.0 if edge in (0, 2) else mx - 60.0
+                remaining = target - depth
+                if abs(remaining) <= 24:
+                    return
+                if edge in (0, 2) and depth <= 100.0:
+                    return
+                if edge in (1, 3) and depth >= mx - 100.0:
+                    return
+                req = int(round(remaining / rate))
+                req = max(-200, min(200, req))
+                if abs(remaining) < 220:
+                    req = (1 if req > 0 else -1) * max(1, min(10, abs(req)))
+                if req == 0:
+                    return
+                if edge in (0, 1):
+                    session.mouse_move(req, 0)
+                else:
+                    session.mouse_move(0, req)
+                sent = time.monotonic()
+                nxt = None
+                while time.monotonic() - sent < 0.3:
+                    time.sleep(0.015)
+                    if monitor.position_at > sent:
+                        nxt = monitor.latest_position(0.4)
+                        break
+                if nxt is None:
+                    nxt = monitor.latest_position(0.4)
+                    if nxt is None:
+                        return
+                moved = (nxt[0] - px) if edge in (0, 1) else (nxt[1] - py)
+                if abs(moved) > 0.5:
+                    observed = moved / float(req)
+                    if 0.5 <= observed <= 300.0:
+                        rate = max(1.0, min(300.0, 0.55 * observed + 0.45 * rate))
+                _dbg_edge("depth-after-arm depth=%.1f target=%.1f req=%d rate=%.2f"
+                          % (depth, target, req, rate))
+        except Exception:
             return
-
-        def depth_of(p):
-            px, py = p[0], p[1]
-            if edge in (0, 1):
-                return px
-            return py
-
-        def max_of(p):
-            return p[2] if edge in (0, 1) else p[3]
-
-        # edge 0=安卓在电脑右侧（共享边是安卓左缘 x=0）；1=左侧（右缘）；
-        # 2=下方（上缘 y=0）；3=上方（下缘）。
-        if edge in (0, 2):
-            depth_target = 60.0
-        else:
-            depth_target = max_of(pos) - 60.0
-        if abs(depth_target - depth_of(pos)) <= 120:
-            return
-        while time.monotonic() < deadline:
-            if not self._armed or session.closed or not self._sharing:
-                return
-            if self.pointer_monitor is not monitor or user_moved():
-                return
-            pos = monitor.latest_position(0.5)
-            if pos is None:
-                return
-            depth = depth_of(pos)
-            remaining = depth_target - depth
-            if abs(remaining) <= 20:
-                return
-            if edge == 0 and depth < 30:
-                return
-            if edge == 1 and depth > max_of(pos) - 30:
-                return
-            if edge == 2 and depth < 30:
-                return
-            if edge == 3 and depth > max_of(pos) - 30:
-                return
-            request = int(round(remaining / rate))
-            request = max(-40, min(40, request))
-            if abs(remaining) < 160:
-                request = max(-6, min(6, request))
-            if request == 0:
-                return
-            try:
-                send_depth(request)
-            except Exception:
-                return
-            sent_at = time.monotonic()
-            while time.monotonic() - sent_at < 0.4:
-                time.sleep(0.03)
-                if monitor.position_at > sent_at:
-                    break
-            _dbg_edge("align-depth depth=%.1f target=%.1f req=%d" % (depth, depth_target, request))
-        return
 
     def _on_key(self, vk: int, scan: int, extended: bool, up: bool) -> None:
         """接管期间把 PC 键盘事件转发到安卓（由低级键盘钩子回调）。"""

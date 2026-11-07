@@ -350,6 +350,7 @@ class InputCapture:
         self.on_wheel = on_wheel or (lambda v, h: None)
         self.on_toggle = on_toggle or (lambda armed: None)
         self.user_move_seq = 0
+        self.user_move_units = 0
         self.on_edge = on_edge or (lambda edge, entered: None)
         self.on_enter = on_enter or (lambda edge, fraction: None)
         self.on_key = on_key or (lambda vk, scan, extended, up: None)
@@ -578,6 +579,7 @@ class InputCapture:
         dx, dy = raw.mouse.lLastX, raw.mouse.lLastY
         if dx or dy:
             self.user_move_seq += 1
+            self.user_move_units += abs(dx) + abs(dy)
 
         if not self.armed:
             if self.edge_switch and (dx or dy):

@@ -12,6 +12,7 @@ import java.util.regex.*;
 public final class InputShareXPointerProbe {
     private static volatile boolean running = true;
     private static volatile String command = "0";
+    private static volatile int dumpIntervalMs = 100;
     private static final Pattern DEVICE_STATE = Pattern.compile("(?:DeviceId\\()?(\\d+)\\)?:\\[");
     private static final Pattern POINT = Pattern.compile("hoveringPointers=\\[Pointer\\(id=\\d+, MOUSE\\) at \\(([-0-9.]+), ([-0-9.]+)\\)");
     // InputDispatcher 里的鼠标坐标是“未旋转的物理/自然坐标”，而窗口/显示已经按 ROTATION_* 旋转；
@@ -29,7 +30,17 @@ public final class InputShareXPointerProbe {
         Thread control = new Thread(() -> {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.US_ASCII))) {
                 String line;
-                while ((line = reader.readLine()) != null) command = line.trim();
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (line.startsWith("i ")) {
+                        try {
+                            dumpIntervalMs = Math.max(10, Math.min(500,
+                                Integer.parseInt(line.substring(2).trim())));
+                        } catch (NumberFormatException ignored) { }
+                        continue;
+                    }
+                    command = line;
+                }
             } catch (IOException ignored) { }
             finally { running = false; Process.killProcess(Process.myPid()); }
         }, "pointer-control");
@@ -94,7 +105,7 @@ public final class InputShareXPointerProbe {
                     }
                 }
             }
-            Thread.sleep(100);
+            Thread.sleep(dumpIntervalMs);
         }
         dumper.shutdownNow();
     }

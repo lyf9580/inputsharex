@@ -126,6 +126,12 @@ class AppController(QObject):
         self.device_link: DeviceLink | None = None
         self._armed = False
         self._enter_fraction: float | None = None
+        # Last known Android cursor position (x, y, max_x, max_y) from an
+        # edge-return event.  Reused to predict the entry landing point
+        # without waiting for a slow remote position dump.
+        self._last_android_pos: tuple[float, float, float, float] | None = None
+        self._align_rate = 2.0
+
         # 共享期间临时打开“物理键盘也显示软键盘”，结束/退出时恢复用户原设置。
         self._ime_hard_kb_old: str | None = None
         self._stop = False
@@ -253,6 +259,7 @@ class AppController(QObject):
         if boundary:
             # 安卓端沿共享边的比例位置：横向相邻取 y，纵向相邻取 x；
             # 坐标已在探针里换算成当前旋转后的逻辑坐标，因此横竖屏都通用。
+            self._last_android_pos = (x, y, mx, my)
             if self.config.get("placement", 0) in (0, 1):
                 fraction = y / my
             else:
@@ -798,15 +805,16 @@ class AppController(QObject):
                 self.session.create_keyboard("inputsharex")
             except Exception:
                 pass
-        if armed and self._enter_fraction is not None:
+        if armed:
             fraction = self._enter_fraction
             self._enter_fraction = None
-            threading.Thread(
-                target=self._align_depth_after_arm,
-                args=(fraction,),
-                name="align-depth",
-                daemon=True,
-            ).start()
+            if fraction is not None:
+                threading.Thread(
+                    target=self._verify_entry_alignment,
+                    args=(fraction,),
+                    name="align-verify",
+                    daemon=True,
+                ).start()
         self._publish_sharing_state()
         if armed:
             self._log("鼠标已切换到安卓端（移动回原侧边缘可切回）")
@@ -831,22 +839,63 @@ class AppController(QObject):
             pass
 
     def _pre_align_parallel(self, fraction: float) -> None:
-        """Align the cursor along the shared edge *before* the mouse is captured.
+        """Move the Android cursor to the proportional landing point.
 
-        Runs synchronously inside the edge-entry callback so the user sees the
-        Android cursor already at the proportional height on the very first
-        frame.  Only the parallel axis moves here: it can never trigger the
-        shared-edge return.  Hard-bounded to ~1s.
+        The Android side only accepts relative mouse reports and a remote
+        position dump costs ~350 ms, so a closed loop here can never be as
+        fast as the local Windows return.  Instead we predict the required
+        relative move from the last known Android position (captured on the
+        previous edge-return) and send it in one go; a single asynchronous
+        correction runs after capture arms.
         """
         session = self.session
         monitor = self.pointer_monitor
         if session is None or monitor is None or session.closed or not self._sharing:
             return
         edge = int(self.config.get("placement", 0))
+        last = self._last_android_pos
+        if last is None:
+            # No cached position yet (first entry after app start).  Do not
+            # stall the capture here: the post-arm verify thread will read the
+            # live position and correct once the device is captured.
+            _dbg_edge("pre-align-predict no-cache")
+            return
+        px, py, max_x, max_y = last
+        tx, ty = entry_target(edge, fraction, max_x, max_y)
+        if edge in (0, 1):
+            cur, target = py, ty
+            axis = 1
+        else:
+            cur, target = px, tx
+            axis = 0
+        remaining = target - cur
+        if abs(remaining) <= 24:
+            _dbg_edge("pre-align-predict skip remaining=%.1f" % remaining)
+            return
+        units = int(round(remaining / self._align_rate))
+        units = max(-800, min(800, units))
+        if units == 0:
+            units = 1 if remaining > 0 else -1
         try:
-            monitor.set_enabled(True, time.time_ns(), edge)
+            if axis == 1:
+                session.mouse_move(0, units)
+            else:
+                session.mouse_move(units, 0)
         except Exception:
             return
+        _dbg_edge(
+            "pre-align-predict remaining=%.1f units=%d rate=%.2f"
+            % (remaining, units, self._align_rate)
+        )
+
+    def _verify_entry_alignment(self, fraction: float) -> None:
+        """Correct the predicted landing and learn the real Android rate."""
+        session = self.session
+        monitor = self.pointer_monitor
+        if session is None or monitor is None:
+            return
+        edge = int(self.config.get("placement", 0))
+        units_before = getattr(self.capture, "user_move_units", 0)
         try:
             if edge in (0, 1):
                 session.mouse_move(0, 1)
@@ -856,130 +905,71 @@ class AppController(QObject):
                 session.mouse_move(1, 0)
                 time.sleep(0.05)
                 session.mouse_move(-1, 0)
-            deadline = time.monotonic() + 1.0
-            pos = None
-            while time.monotonic() < deadline and pos is None:
-                pos = monitor.latest_position(0.4)
-                if pos is None:
-                    time.sleep(0.02)
-            if pos is None:
+        except Exception:
+            pass
+        deadline = time.monotonic() + 2.0
+        pos = None
+        while time.monotonic() < deadline:
+            pos = monitor.latest_position(0.5)
+            if pos is not None:
+                break
+            time.sleep(0.03)
+        if pos is None:
+            _dbg_edge("align-verify no-position")
+            return
+        for attempt in range(5):
+            if not self._armed or self._sharing is not True:
                 return
-            rate = 40.0
-            for _ in range(16):
-                if time.monotonic() > deadline or session.closed or not self._sharing:
-                    return
-                px, py, max_x, max_y = pos
-                tx, ty = entry_target(edge, fraction, max_x, max_y)
-                if edge in (0, 1):
-                    cur, target = py, ty
+            if getattr(self.capture, "user_move_units", 0) - units_before > 6:
+                _dbg_edge("align-verify user-moved")
+                return
+            px, py, max_x, max_y = pos
+            tx, ty = entry_target(edge, fraction, max_x, max_y)
+            if edge in (0, 1):
+                cur, target, axis = py, ty, 1
+            else:
+                cur, target, axis = px, tx, 0
+            error = target - cur
+            _dbg_edge(
+                "align-verify attempt=%d error=%.1f rate=%.2f"
+                % (attempt, error, self._align_rate)
+            )
+            if abs(error) <= 24:
+                return
+            units = int(round(error / self._align_rate))
+            units = max(-700, min(700, units))
+            if units == 0:
+                units = 1 if error > 0 else -1
+            try:
+                if axis == 1:
+                    session.mouse_move(0, units)
                 else:
-                    cur, target = px, tx
-                remaining = target - cur
-                if abs(remaining) <= 12:
-                    _dbg_edge("pre-align done remaining=%.1f" % remaining)
-                    return
-                req = int(round(remaining / rate))
-                req = max(-260, min(260, req))
-                if req == 0:
-                    req = 1 if remaining > 0 else -1
-                if abs(remaining) < 60:
-                    req = (1 if req > 0 else -1) * max(1, min(8, abs(req)))
-                if edge in (0, 1):
-                    session.mouse_move(0, req)
-                else:
-                    session.mouse_move(req, 0)
-                sent = time.monotonic()
-                nxt = None
-                while time.monotonic() - sent < 0.3:
-                    time.sleep(0.015)
-                    if monitor.position_at > sent:
-                        nxt = monitor.latest_position(0.4)
-                        break
-                if nxt is None:
-                    nxt = monitor.latest_position(0.4)
-                    if nxt is None:
-                        return
-                moved = (nxt[1] - py) if edge in (0, 1) else (nxt[0] - px)
-                if abs(moved) > 0.5:
-                    observed = moved / float(req)
-                    if 0.5 <= observed <= 300.0:
-                        rate = max(1.0, min(300.0, 0.55 * observed + 0.45 * rate))
-                _dbg_edge("pre-align cur=%.1f target=%.1f req=%d rate=%.2f"
-                          % (cur, target, req, rate))
-                pos = nxt
-        except Exception:
-            return
-
-    def _align_depth_after_arm(self, fraction: float) -> None:
-        """After capture arms, move the cursor just inside the shared edge."""
-        session = self.session
-        monitor = self.pointer_monitor
-        if session is None or monitor is None:
-            return
-        edge = int(self.config.get("placement", 0))
-        capture = self.capture
-        start_units = getattr(capture, "user_move_units", 0) if capture is not None else 0
-
-        def user_moved() -> bool:
-            if capture is None:
-                return False
-            return getattr(capture, "user_move_units", start_units) - start_units > 3
-
-        try:
-            time.sleep(0.05)
-            deadline = time.monotonic() + 1.4
-            rate = 40.0
-            for _ in range(10):
-                if time.monotonic() > deadline or not self._armed or session.closed or not self._sharing:
-                    return
-                if self.pointer_monitor is not monitor or user_moved():
-                    return
-                pos = monitor.latest_position(0.4)
-                if pos is None:
-                    return
-                px, py, max_x, max_y = pos
-                if edge in (0, 1):
-                    depth, mx = px, max_x
-                else:
-                    depth, mx = py, max_y
-                target = 60.0 if edge in (0, 2) else mx - 60.0
-                remaining = target - depth
-                if abs(remaining) <= 24:
-                    return
-                if edge in (0, 2) and depth <= 100.0:
-                    return
-                if edge in (1, 3) and depth >= mx - 100.0:
-                    return
-                req = int(round(remaining / rate))
-                req = max(-200, min(200, req))
-                if abs(remaining) < 220:
-                    req = (1 if req > 0 else -1) * max(1, min(10, abs(req)))
-                if req == 0:
-                    return
-                if edge in (0, 1):
-                    session.mouse_move(req, 0)
-                else:
-                    session.mouse_move(0, req)
-                sent = time.monotonic()
-                nxt = None
-                while time.monotonic() - sent < 0.3:
-                    time.sleep(0.015)
-                    if monitor.position_at > sent:
-                        nxt = monitor.latest_position(0.4)
-                        break
-                if nxt is None:
-                    nxt = monitor.latest_position(0.4)
-                    if nxt is None:
-                        return
-                moved = (nxt[0] - px) if edge in (0, 1) else (nxt[1] - py)
-                if abs(moved) > 0.5:
-                    observed = moved / float(req)
-                    if 0.5 <= observed <= 300.0:
-                        rate = max(1.0, min(300.0, 0.55 * observed + 0.45 * rate))
-                _dbg_edge("depth-after-arm depth=%.1f target=%.1f req=%d rate=%.2f"
-                          % (depth, target, req, rate))
-        except Exception:
-            return
+                    session.mouse_move(units, 0)
+            except Exception:
+                return
+            sent_at = time.monotonic()
+            new_pos = None
+            while time.monotonic() - sent_at < 0.7:
+                candidate = monitor.latest_position(0.5)
+                if candidate is not None and monitor.position_at >= sent_at:
+                    new_pos = candidate
+                    break
+                time.sleep(0.02)
+            if new_pos is None:
+                _dbg_edge("align-verify no-feedback")
+                return
+            npx, npy, _, _ = new_pos
+            new_cur = npy if axis == 1 else npx
+            moved = new_cur - cur
+            if abs(units) > 0 and abs(moved) >= 1:
+                observed = abs(moved) / float(abs(units))
+                if 0.2 <= observed <= 400.0:
+                    self._align_rate = max(0.2, min(400.0, observed))
+            _dbg_edge(
+                "align-verify moved=%.1f units=%d rate=%.2f"
+                % (moved, units, self._align_rate)
+            )
+            pos = new_pos
 
     def _on_key(self, vk: int, scan: int, extended: bool, up: bool) -> None:
         """接管期间把 PC 键盘事件转发到安卓（由低级键盘钩子回调）。"""

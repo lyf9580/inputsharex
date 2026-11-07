@@ -98,6 +98,17 @@ class PointerMonitor:
         _dbg(f"set_enabled desired={self.desired.strip()} available={self.available} pid={self.pid}")
         self._write()
 
+    def set_interval(self, interval_ms: int) -> None:
+        """Temporarily change the probe sampling interval (milliseconds)."""
+        line = "i %d\n" % int(interval_ms)
+        with self.lock:
+            if self.proc and self.proc.poll() is None and self.available:
+                try:
+                    self.proc.stdin.write(line.encode())
+                    self.proc.stdin.flush()
+                except (OSError, ValueError):
+                    pass
+
     def stop(self):
         proc = self.proc
         if proc is None:
